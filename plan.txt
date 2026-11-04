@@ -54,6 +54,10 @@ profiles:
     └── ollama-pull  one-shot: pulls $MODEL after ollama is healthy
 
 volumes: data (SQLite checkpoints), workspace (shared scratch), ollama_models
+Deployment: lives in ~/Docker_Enviorment/harness (auto-discovered by start_all.sh);
+PORT=8100 + COMPOSE_PROFILES come from .env; restart policies + watchtower
+opt-out labels on all services; UI at http://ubuntu:8100, listed on the homepage
+under "AI & LLM Services". Run history and models survive restarts via volumes.
 Ollama default is the internal service; remote GPU box via
   OLLAMA_URL=http://host.docker.internal:11434 MODEL=qwen2.5:7b docker compose up
 This box: GTX 1660 Ti 6GB → MODEL default qwen2.5:3b (~1.9GB, fast, weak-but-works).
@@ -97,7 +101,7 @@ SQLite `/data/harness.db`, one row per run, full JSON snapshot on every mutation
 - **P2 — tooling**: dynamic tool registration (drop .py in sandbox, schema via API), MCP stdio client + hot-reload, web search/fetch (SearXNG already on :8095 host), doc writer
 - **P3 — mesh (partially done)**: agent registry (heartbeat/position/phase), claim leases (stale RUNNING requeues, skips approval-pending nodes), claim locality (agents grow their branch), III-B messaging as mailbox events (Task/Result/Redirect/Heartbeat), Redirect handoffs, patch approvals with edit-and-resubmit, events persisted (cap 500/run). TODO: claim lease edge cases, routing per Algorithm 2, autosizer (max_agents editable via POST /policy; `LLM.ping()` suggestion TODO)
 - **S2+S6+UI (done, this change)**: 19 tests. Hardening: claim lease, stale-report 409, decompose state guard, forward-dep errors, sandbox unreachable → rc:-4, DELETE /runs. Agents: registry/heartbeat/phase, locality, Redirect, patch approvals. UI: SVG layered canvas (pan/zoom/fit, bezier edges), agent chips gliding node→node, flashing patch-approval nodes → click → edit-and-approve dialog, persistent per-run event log, run deletion, attention counter. **Verified live**: intent run → LLM decompose → patch approval (agent phase waiting-approval) → approve → exec → DONE; `mesh-works` in workspace.
-- **S4 deploy**: restart policies, localhost bind, healthchecks, pin requirements, .env.example
+- **S4 deploy (done)**: moved to ~/Docker_Enviorment/harness; restart: unless-stopped on core/sandbox/agent/ollama; watchtower opt-out labels (auto-updates would break local builds & restart ollama mid-inference); PORT default 8100 (8000 = lazytainer); .env carries PORT+COMPOSE_PROFILES so start_all.sh picks the whole stack up flag-free; homepage entry under "AI & LLM Services"; commit before move for safety. TODO if ever exposed beyond LAN: localhost bind / reverse proxy + auth.
 - **S5 paper tools**: web_search (SearXNG :8095 host), http_fetch, workspace files panel, examples/write-paper template
 - **P4 — loops & budgets**: LoopSpec unrolling, parallel ready-set, budget governor (max_llm_calls/max_seconds enforcement)
 - **P5 — metrics/paper**: latency, TSR, FRT, delegation depth, KG-consistency proxy; recorded acceptance demo

@@ -5,7 +5,10 @@ services:
     image: harness:latest
     build: .
     command: uvicorn harness.core:app --host 0.0.0.0 --port 8000
-    ports: ["${PORT:-8000}:8000"]
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    ports: ["${PORT:-8100}:8000"]
     volumes:
       - data:/data
       - ./harness.toml:/app/harness.toml:ro
@@ -22,6 +25,9 @@ services:
     image: harness:latest
     build: .
     command: uvicorn harness.sandbox:app --host 0.0.0.0 --port 8001
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
     volumes:
       - workspace:/workspace
     environment:
@@ -31,6 +37,9 @@ services:
     image: harness:latest
     build: .
     command: python -m harness.agent
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
     environment:
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       MODEL: ${MODEL:-qwen2.5:3b}
@@ -46,6 +55,9 @@ services:
   ollama:
     image: ollama/ollama:latest
     profiles: ["local-ollama"]
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
     volumes:
       - ollama_models:/root/.ollama
     environment:

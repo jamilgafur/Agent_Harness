@@ -4,7 +4,11 @@ Research multi-agent harness: a growing task DAG decomposed by small local LLM
 agents, all tool use gated through a shared sandbox with user approvals.
 Everything runs in Docker. See `plan.txt` for the full design and roadmap.
 
-## Run
+Deployed as a home-server stack at `~/Docker_Enviorment/harness` (picked up
+automatically by `start_all.sh`). UI: http://ubuntu:8100 (homepage: "AI & LLM
+Services"). Port/profile/model come from `.env` — no flags needed.
+
+## Run (standalone)
 
 ```sh
 docker compose --profile local-ollama up --build   # + local GPU LLM (pulls qwen2.5:3b once)
