@@ -37,10 +37,12 @@ def descendants(nodes: Dict[str, Node], nid: str) -> List[str]:
 
 
 def validate(nodes: Dict[str, Node], known_tools: Iterable[str],
-             max_depth: int = DEFAULT_MAX_DEPTH, max_nodes: int = 300) -> List[str]:
+             max_depth: int = DEFAULT_MAX_DEPTH, max_nodes: int = 300,
+             auto_approve: Iterable[str] = ()) -> List[str]:
     """Return a list of validation errors ([] = valid). Pure function, easy to test."""
     errors: List[str] = []
     tools = set(known_tools)
+    preapproved = set(auto_approve)
     if len(nodes) > max_nodes:
         errors.append(f"budget: {len(nodes)} nodes exceeds max_nodes={max_nodes}")
     g = nx.DiGraph()
@@ -55,6 +57,11 @@ def validate(nodes: Dict[str, Node], known_tools: Iterable[str],
             errors.append(f"{n.id}: empty intent")
         if n.tool and n.tool not in tools and n.type == NodeType.TASK:
             errors.append(f"{n.id}: unknown tool {n.tool!r}")
+        # judged nodes must state their success criteria up front; auto-approved
+        # tools get a deterministic default instead (shell: rc==0)
+        if (n.type == NodeType.TASK and n.tool and n.tool not in preapproved
+                and not n.success_predicate.strip()):
+            errors.append(f"{n.id}: tool node needs a success_predicate (tool not auto-approved)")
         if n.type == NodeType.LOOP and (not n.condition or n.max_iterations < 1):
             errors.append(f"{n.id}: loop node needs condition and max_iterations >= 1")
     if errors:  # structural errors make graph checks meaningless
@@ -79,10 +86,11 @@ def lint(nodes: Dict[str, Node]) -> List[str]:
 
 
 def apply_patch(nodes: Dict[str, Node], patch: Patch, known_tools: Iterable[str],
-                max_depth: int = DEFAULT_MAX_DEPTH, max_nodes: int = 300
+                max_depth: int = DEFAULT_MAX_DEPTH, max_nodes: int = 300,
+                auto_approve: Iterable[str] = ()
                 ) -> Tuple[Optional[Dict[str, Node]], List[str]]:
     """Validate a patch against a *copy*; return (new_nodes, errors). Original untouched."""
-    trial = {k: v.copy(deep=True) for k, v in nodes.items()}
+    trial = {k: v.model_copy(deep=True) for k, v in nodes.items()}
     errors: List[str] = []
     for op in patch.ops:
         if op.op == "add_node":
@@ -108,22 +116,26 @@ def apply_patch(nodes: Dict[str, Node], patch: Patch, known_tools: Iterable[str]
         elif op.op == "retry_node":
             if op.node_id in trial:
                 n = trial[op.node_id]
-                n.state = NodeState.PENDING
-                n.attempts = 0
+                if any(v.parent == op.node_id for v in trial.values()):
+                    errors.append(f"retry_node: {op.node_id} has children — retry the failing child")
+                else:
+                    n.state = NodeState.PENDING
+                    n.attempts = 0
+                    n.hint = ""
             else:
                 errors.append(f"retry_node: unknown node {op.node_id}")
         else:
             errors.append(f"unknown op {op.op!r}")
     if errors:
         return None, errors
-    verrs = validate(trial, known_tools, max_depth, max_nodes)
+    verrs = validate(trial, known_tools, max_depth, max_nodes, auto_approve)
     return (None, verrs) if verrs else (trial, [])
 
 
 def ready_nodes(nodes: Dict[str, Node]) -> List[Node]:
-    """Topologically-ready work: PENDING, all deps DONE."""
+    """Topologically-ready work: PENDING or REPAIRING, all deps DONE."""
     return [n for n in nodes.values()
-            if n.state == NodeState.PENDING
+            if n.state in (NodeState.PENDING, NodeState.REPAIRING)
             and all(nodes[d].state == NodeState.DONE for d in n.deps)]
 
 

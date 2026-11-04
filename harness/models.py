@@ -14,6 +14,9 @@ DEFAULT_POLICY = {
     "max_repairs": 3,
     "confirm_actions": True,      # answer 13: confirm-everything mode
     "auto_approve": [],           # tool names pre-approved for unattended runs
+    "approve_dag_edits": True,    # agent decompositions gated behind approval+edit dialog
+    "claim_lease_seconds": 120,   # stale RUNNING nodes requeue after this
+    "heartbeat_seconds": 5,
     "max_agents": 2,
 }
 
@@ -47,6 +50,8 @@ class Node(BaseModel):
     result: Optional[Any] = None
     attempts: int = 0
     hint: str = ""
+    parent: str = ""           # set when created by decomposition; parent waits on children
+    claimed_at: float = 0.0    # heartbeat of the last claim; stale RUNNING nodes are requeued
     # loop nodes only: condition is judged each iteration, body is child ids
     condition: str = ""
     max_iterations: int = 10

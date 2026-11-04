@@ -31,7 +31,9 @@ def load(path: str = "harness.toml") -> Dict[str, Any]:
         cfg.update(file_cfg)
     env_json = os.environ.get("HARNESS_CONFIG")
     if env_json:
-        cfg.update(json.loads(env_json))
+        env_cfg = json.loads(env_json)
+        cfg["policy"].update(env_cfg.pop("policy", {}))
+        cfg.update(env_cfg)
     for key in ("ollama_url", "model", "core_url", "sandbox_url"):
         env = os.environ.get(key.upper())
         if env:

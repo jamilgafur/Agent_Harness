@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+pydantic
+networkx
+ollama
+httpx
+pytest

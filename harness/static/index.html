@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent Harness</title>
+<style>
+  :root { --bg:#0b0f14; --panel:#12181f; --line:#2b333c; --fg:#e6edf3; --dim:#8b949e; }
+  * { box-sizing:border-box; font:13px/1.45 ui-monospace,SFMono-Regular,monospace; }
+  body { margin:0; background:var(--bg); color:var(--fg); }
+  header { display:flex; gap:14px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; background:var(--panel); position:sticky; top:0; z-index:5; }
+  h1 { font-size:15px; margin:0; }
+  .chip { padding:2px 9px; border-radius:10px; border:1px solid var(--line); font-size:12px; color:var(--dim); }
+  .chip.attn { color:#e3b341; border-color:#e3b341; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:8px 14px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button, input, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
+  button { cursor:pointer; } button:hover { border-color:#58a6ff; }
+  textarea { width:100%; min-height:64px; font-size:12px; }
+  #viewport { position:relative; height:52vh; min-height:340px; border:1px solid var(--line); border-top:none; overflow:hidden; background:
+      radial-gradient(circle, #1d2530 1px, transparent 1px) 0 0/24px 24px, var(--bg); cursor:grab; margin:0 14px; border-radius:0 0 8px 8px; }
+  #viewport:active { cursor:grabbing; }
+  #canvas { position:absolute; inset:0; width:100%; height:100%; }
+  .node rect { fill:#161d26; stroke:#8b949e; stroke-width:1.4; rx:8; }
+  .node text { fill:var(--fg); font-size:11px; pointer-events:none; }
+  .node .sub { fill:var(--dim); font-size:9.5px; }
+  .node { cursor:pointer; }
+  .node.RUNNING rect { stroke:#58a6ff; stroke-width:2; animation:pulse 1.4s infinite; }
+  .node.DONE rect { stroke:#3fb950; } .node.PENDING rect { stroke:#8b949e; }
+  .node.WAITING rect { stroke:#d29922; } .node.REPAIRING rect { stroke:#e3b341; stroke-dasharray:5 3; }
+  .node.FAILED rect, .node.BLOCKED rect { stroke:#f85149; }
+  .node.ESCALATED rect { stroke:#bc4cf0; }
+  .node.needsApproval rect { animation:flash 1s infinite; }
+  @keyframes pulse { 0%,100%{stroke-opacity:1} 50%{stroke-opacity:.35} }
+  @keyframes flash { 0%,100%{stroke:#e3b341; stroke-width:1.8} 50%{stroke:#ffd757; stroke-width:4} }
+  .edge { fill:none; stroke:#3b4654; stroke-width:1.6; }
+  .edge.done { stroke:#3fb95066; }
+  .agent { pointer-events:none; }
+  .agent circle { fill:#0b0f14; stroke-width:2.2; }
+  .agent text { fill:var(--fg); font-size:10px; font-weight:bold; }
+  .agent .ph { font-size:9px; fill:var(--dim); }
+  .agent.needhelp .q { fill:#e3b341; font-size:15px; font-weight:bold; }
+  #log { height:130px; overflow:auto; font-size:12px; }
+  #log div { padding:1px 4px; border-radius:4px; }
+  #log .warn { color:#e3b341; } #log .error { color:#f85149; }
+  #detail { white-space:pre-wrap; font-size:11.5px; color:var(--dim); max-height:220px; overflow:auto; }
+  #modal { position:fixed; inset:0; background:#0009; display:none; align-items:center; justify-content:center; z-index:10; }
+  #modal .card { width:min(720px,92vw); max-height:86vh; overflow:auto; }
+  .agrow { display:flex; gap:10px; flex-wrap:wrap; }
+  .acard { border:1px solid var(--line); border-radius:8px; padding:6px 10px; min-width:150px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+  .dot.on { background:#3fb950; } .dot.off { background:#555; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⛓ Agent Harness</h1>
+  <span class="chip" id="health">…</span>
+  <span class="chip" id="attention"></span>
+  <span class="chip" id="agentcount"></span>
+  <span class="chip"><button onclick="fit()">fit</button><button onclick="zoom(1.25)">+</button><button onclick="zoom(0.8)">−</button></span>
+</header>
+
+<div class="panel row">
+  <input id="intent" placeholder="new run intent (LLM decomposes it)…" style="flex:1;min-width:260px">
+  <button onclick="createIntent()">run</button>
+  <button onclick="tpbox.style.display=tpbox.style.display==='none'?'block':'none'">template DAG</button>
+  <span id="runs" class="row"></span>
+</div>
+<div class="panel" id="tpbox" style="display:none">
+  <textarea id="template"></textarea>
+  <div class="row" style="margin-top:6px"><button onclick="createTemplate()">import template</button>
+  <span class="chip">validated on import; runs unaided when tools are auto-approved</span></div>
+</div>
+
+<div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
+<div class="panel agrow" id="agents"></div>
+<div class="panel"><b>Node</b> <span id="detailhint" class="chip">click a node</span><div id="detail"></div></div>
+<div class="panel"><b>Events</b><div id="log"></div></div>
+
+<div id="modal"><div class="panel card"><div id="modalbody"></div></div></div>
+
+<script>
+// ---------- state ----------
+let RUN=null, NODES={}, PENDING=new Set(), AGENTS={}, STATS={}, WS=null;
+let view={x:40,y:30,k:1}; const W=200,H=60,CW=270,RH=86;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined});
+  const j=await r.json().catch(()=>({})); if(!r.ok){logLine({level:'error',msg:`${m} ${p}: ${JSON.stringify(j.detail??j)}`}); throw new Error(r.status);} return j;};
+
+// ---------- boot / ws ----------
+async function boot(){
+  const h=await api('GET','/health'); $('health').textContent=`core ✓ ollama ${h.ollama?'✓':'✗'}`;
+  $('template').value=JSON.stringify({nodes:[
+    {id:"w",intent:"write welcome file",tool:"write_file",args:{path:"hello.txt",content:"hi from the harness\n"}},
+    {id:"r",intent:"show the file",tool:"shell",args:{cmd:"cat hello.txt"},deps:["w"]}]},null,2);
+  await refreshRuns(); ws();
+}
+function ws(){
+  const s=new WebSocket(`ws://${location.host}/ws`); WS=s;
+  s.onmessage=ev=>{const m=JSON.parse(ev.data);
+    if(m.type==='state'){ if(m.run_id===RUN){applyState(m);} }
+    if(m.type==='agents'){AGENTS=m.agents; drawAgents(); drawAgentsPanel(); attention();}
+    if(m.type==='log'){ if(m.event.run_id===RUN) logLine(m.event); }
+    if(m.type==='approval'){ attention(); if(m.approval.run_id===RUN){ PENDING=new Set(m.approval.status==='pending'?[...PENDING,m.approval.node_id]:[...PENDING].filter(x=>x!==m.approval.node_id)); draw(); } }
+    if(m.type==='run'||m.type==='run_deleted') refreshRuns();
+  };
+  s.onclose=()=>setTimeout(ws,3000);
+}
+async function refreshRuns(){
+  const runs=await api('GET','/runs');
+  $('runs').innerHTML=runs.map(r=>`<button class="${r.id===RUN?'attn chip':''}" onclick="selRun('${r.id}')" title="${esc(r.intent)}">${r.id}${r.active?'':' ✓'}</button>${r.active?'':`<button onclick="delRun('${r.id}','${r.id}')" title="delete">🗑</button>`}`).join('')||'<span class="chip">no runs yet</span>';
+  if(!RUN&&runs[0]) selRun(runs[0].id);
+}
+async function selRun(id){
+  RUN=id; NODES={}; PENDING=new Set(); $('log').innerHTML='';
+  const r=await api('GET',`/runs/${id}`); applyState({nodes:r.nodes,stats:r.stats,pending:r.pending||[],active:r.active});
+  (await api('GET',`/runs/${id}/events`)).forEach(logLine);
+}
+async function delRun(id){ if(!confirm('delete run '+id+'?'))return; await api('DELETE',`/runs/${id}`); if(RUN===id){RUN=null;$('world').innerHTML='';refresh();} refreshRuns(); }
+function applyState(m){ NODES=m.nodes; STATS=m.stats; PENDING=new Set(m.pending||[]); draw(); attention(); }
+function refresh(){ const s=Object.entries(NODES).length?{nodes:NODES,stats:STATS,pending:[...PENDING]}:null; if(s)draw(); }
+
+// ---------- layout ----------
+function layout(){
+  const nodes=Object.values(NODES); const byD={};
+  nodes.forEach(n=>{(byD[n.depth]=byD[n.depth]||[]).push(n);});
+  Object.values(byD).forEach(col=>col.sort((a,b)=>a.id.localeCompare(b.id)));
+  const maxCol=Math.max(1,...Object.values(byD).map(c=>c.length));
+  const pos={};
+  Object.entries(byD).forEach(([d,col])=>{
+    const off=(maxCol-col.length)*RH/2;
+    col.forEach((n,i)=>{pos[n.id]={x:Number(d)*CW, y:off+i*RH};});
+  });
+  return pos;
+}
+
+// ---------- draw ----------
+function draw(){
+  const pos=layout(), g=$('world'); let html='';
+  for(const n of Object.values(NODES)){
+    for(const d of n.deps){
+      if(!NODES[d]||!pos[d]||!pos[n.id])continue;
+      const p0=pos[d],p1=pos[n.id],x0=p0.x+W,y0=p0.y+H/2,x1=p1.x,y1=p1.y+H/2,mx=(x1-x0)/2;
+      html+=`<path class="edge ${NODES[d].state==='DONE'?'done':''}" d="M${x0},${y0} C${x0+mx},${y0} ${x1-mx},${y1} ${x1},${y1}"/>`;
+    }
+  }
+  for(const n of Object.values(NODES)){
+    const p=pos[n.id]; if(!p)continue;
+    const need=PENDING.has(n.id);
+    const tool=n.tool?`⚙ ${n.tool}`:'◈ decomposed/abstract';
+    html+=`<g class="node ${n.state} ${need?'needsApproval':''}" data-nid="${esc(n.id)}" transform="translate(${p.x},${p.y})">
+      <rect width="${W}" height="${H}"/><text x="10" y="18">${esc(n.id.length>22?n.id.slice(0,21)+'…':n.id)}  · ${n.state}${n.attempts>1?' ×'+n.attempts:''}</text>
+      <text class="sub" x="10" y="34">${esc(n.intent.length>34?n.intent.slice(0,33)+'…':n.intent)||' '}</text>
+      <text class="sub" x="10" y="49">${esc(tool)}${n.hint?' — ⚠ '+esc(n.hint.slice(0,24)):''}</text></g>`;
+  }
+  g.innerHTML=html;
+  g.querySelectorAll('.node').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();clickNode(el.dataset.nid);}));
+  applyView(); drawAgents();
+}
+function drawAgents(){
+  const pos=layout(), L=$('agentlayer');
+  const hue=s=>[...s].reduce((a,c)=>a+c.charCodeAt(0),0)%360;
+  L.innerHTML=Object.entries(AGENTS).filter(([_,a])=>a.node_id&&NODES[a.node_id]&&pos[NODES[a.node_id]]).map(([id,a])=>{
+    const p=pos[NODES[a.node_id]], need=PENDING.has(NODES[a.node_id].id);
+    return `<g class="agent ${need?'needhelp':''}" style="transform:translate(${p.x+W-34}px,${p.y-24}px);transition:transform .7s">
+      <circle cx="14" cy="14" r="13" style="stroke:${a.alive?`hsl(${hue(id)},70%,55%)`:'#555'}"/>
+      <text x="14" y="18" text-anchor="middle">${esc(id.replace(/^agent-?/,'')[0]||'A').toUpperCase()}</text>
+      ${need?'<text class="q" x="24" y="4">?</text>':`<text class="ph" x="28" y="20">${esc(a.phase.slice(0,12))}</text>`}</g>`;
+  }).join('');
+}
+function drawAgentsPanel(){
+  $('agents').innerHTML='<b>Agents:</b>'+(Object.entries(AGENTS).map(([id,a])=>
+    `<div class="acard"><span class="dot ${a.alive?'on':'off'}"></span><b>${esc(id)}</b>
+     <div class="sub">${esc(a.phase)} ${a.node_id?'@ '+esc(a.node_id):''}</div>
+     <div class="sub">beat ${a.age}s ago</div></div>`).join('')||'<span class="chip">none seen yet</span>');
+  $('agentcount').textContent=`agents: ${Object.values(AGENTS).filter(a=>a.alive).length}`;
+}
+async function attention(){
+  const pend=(await api('GET','/approvals?status=pending')).length;
+  const esc_ = Object.values(NODES).filter(n=>n.state==='ESCALATED').length;
+  $('attention').textContent=`⚑ ${pend+esc_} need you`; $('attention').className='chip'+(pend+esc_?' attn':'');
+}
+
+// ---------- pan / zoom ----------
+let drag=null;
+const vp=$('viewport');
+vp.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y};vp.setPointerCapture(e.pointerId);});
+vp.addEventListener('pointermove',e=>{if(!drag)return;view.x=drag.vx+(e.clientX-drag.x);view.y=drag.vy+(e.clientY-drag.y);applyView();});
+vp.addEventListener('pointerup',()=>drag=null);
+vp.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY<0?1.12:0.89;zoomAt(f,e.offsetX,e.offsetY);},{passive:false});
+function zoomAt(f,cx,cy){const k2=Math.min(3,Math.max(.2,view.k*f));view.x=cx-(cx-view.x)*k2/view.k;view.y=cy-(cy-view.y)*k2/view.k;view.k=k2;applyView();}
+function zoom(f){zoomAt(f,vp.clientWidth/2,vp.clientHeight/2);}
+function applyView(){$('world').setAttribute('transform',`translate(${view.x},${view.y}) scale(${view.k})`);$('agentlayer').setAttribute('transform',`translate(${view.x},${view.y}) scale(${view.k})`);}
+function fit(){
+  const xs=[],ys=[];Object.values(NODES).forEach(n=>{const p=layout()[n.id];if(p){xs.push(p.x);ys.push(p.y);}});
+  if(!xs.length)return;const w=Math.max(...xs)+W+60,h=Math.max(...ys)+H+40;
+  view.k=Math.min(1.4,vp.clientWidth/w,vp.clientHeight/h);view.x=(vp.clientWidth-Math.max(...xs)*view.k)/2;view.y=(vp.clientHeight-Math.max(...ys)*view.k)/2+10;applyView();
+}
+
+// ---------- node interactions ----------
+async function clickNode(nid){
+  const pend=(await api('GET','/approvals?status=pending')).find(a=>a.node_id===nid&&a.run_id===RUN);
+  if(pend) return openApproval(pend);
+  const n=NODES[nid];
+  $('detail').textContent=JSON.stringify(n,null,2);
+  if(['ESCALATED','FAILED'].includes(n.state))
+    $('detail').innerHTML+=`\n<button onclick="retry('${nid}')">fix &amp; retry</button>`;
+}
+async function retry(id){await api('POST',`/runs/${RUN}/patch`,{ops:[{op:"retry_node",node_id:id}],reason:"user fix"});}
+function openApproval(a){
+  const editable = a.kind==='patch' ? {children:a.args.children} : a.args;
+  $('modalbody').innerHTML=`<b>${a.kind==='patch'?'DAG edit (decompose)':'Tool execution'} — ${esc(a.node_id)}</b>
+    ${a.kind==='patch'?`<div class="sub">children about to be added under <b>${esc(a.node_id)}</b>; edit the JSON, then approve.</div>`
+      :`<div class="sub">tool <b>${esc(a.tool)}</b>; edit args, then approve.</div>`}
+    <textarea id="modargs" style="min-height:${a.kind==='patch'?'240':'140'}px">${esc(JSON.stringify(editable,null,2))}</textarea>
+    <div class="row" style="margin-top:8px"><button onclick="decide('${a.id}',true)">approve${a.kind==='patch'?' (apply edits)':''}</button>
+    <button onclick="decide('${a.id}',false)">reject</button><button onclick="$('modal').style.display='none'">cancel</button></div>`;
+  $('modal').style.display='flex';
+}
+async function decide(id,ok){
+  let args; try{args=JSON.parse($('modargs').value);}catch(e){return alert('bad JSON');}
+  const body = ok ? {decision:'approve',args} : {decision:'reject'};
+  const r=await api('POST',`/approvals/${id}`,body);
+  logLine({level:r.status==='done'?'info':'warn',msg:`approval ${id}: ${r.status}`});
+  $('modal').style.display='none'; attention();
+}
+
+// ---------- runs ----------
+async function createIntent(){const v=$('intent').value.trim();if(!v)return;const r=await api('POST','/runs',{intent:v});$('intent').value='';refreshRuns();selRun(r.run_id);}
+async function createTemplate(){let b;try{b=JSON.parse($('template').value);}catch(e){return alert('bad JSON');}const r=await api('POST','/runs',b);refreshRuns();selRun(r.run_id);}
+function logLine(e){const t=e.ts?new Date(e.ts*1000).toLocaleTimeString():new Date().toLocaleTimeString();
+  const d=document.createElement('div');d.className=e.level||'';d.textContent=`${t} [${e.kind||'-'}] ${e.sender||''}→${e.receiver||''} ${e.msg}`;
+  $('log').prepend(d); while($('log').children.length>150)$('log').lastChild.remove();}
+boot();
+</script>
+</body>
+</html>
