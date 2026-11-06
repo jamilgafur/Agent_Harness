@@ -6,15 +6,18 @@ from pydantic import BaseModel, Field
 
 DEFAULT_MAX_DEPTH = 17  # user requirement: decomposition depth cap
 
+# Code-level defaults. harness.toml (volume-mounted into every container) OVERRIDES
+# these at runtime; env (HARNESS_CONFIG / per-key vars) wins over both. Keep the
+# values below consistent with the shipped harness.toml — see audit finding 9.
 DEFAULT_POLICY = {
     "max_depth": DEFAULT_MAX_DEPTH,
     "max_nodes": 300,
     "max_llm_calls": 500,
     "max_seconds": 7200,
     "max_repairs": 3,
-    "confirm_actions": True,      # answer 13: confirm-everything mode
-    "auto_approve": [],           # tool names pre-approved for unattended runs
-    "approve_dag_edits": True,    # agent decompositions gated behind approval+edit dialog
+    "confirm_actions": True,      # tools not in auto_approve park an approval card
+    "auto_approve": [],           # tool names that execute without confirmation
+    "approve_dag_edits": True,    # True = eyeball every decomposition; shipped default: False
     "claim_lease_seconds": 120,   # stale RUNNING nodes requeue after this
     "heartbeat_seconds": 5,
     "max_agents": 2,

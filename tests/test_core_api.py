@@ -435,3 +435,189 @@ def test_checkpoint_resume(tmp_path, client):
     core.RUNS.update(core.store.load_runs())
     run = client.get(f"/runs/{run_id}").json()
     assert run["id"] == run_id and set(run["nodes"]) == {"w", "r"}
+    # plan-checkpoint fields survive the restart too
+    pid = client.post("/runs", json={"intent": "research y"}).json()["run_id"]
+    client.put(f"/runs/{pid}/constraints", json={"constraints": ["discuss cost"]})
+    core.RUNS.clear()
+    core.RUNS.update(core.store.load_runs())
+    run = client.get(f"/runs/{pid}").json()
+    assert run["phase"] == "planning" and run["constraints"] == ["discuss cost"]
+
+
+# ---------- plan-first checkpoint (intent runs) ----------
+def _intent_children():
+    return {"children": [
+        {"intent": "gather a", "tool": "web_search",
+         "args": {"query": "a", "max_results": 3}, "deps": [],
+         "success_predicate": "hits"},
+        {"intent": "gather b", "tool": "web_search",
+         "args": {"query": "b", "max_results": 3}, "deps": [],
+         "success_predicate": "hits"},
+        {"intent": "synthesize", "tool": "llm", "deps": [0, 1],
+         "success_predicate": "answers the question"}]}
+
+
+def test_intent_runs_plan_first_checkpoint_then_go(client):
+    run_id = client.post("/runs", json={"intent": "research something"}).json()["run_id"]
+    got = client.get(f"/runs/{run_id}").json()
+    assert got["phase"] == "planning" and got["plan_ready"] is False
+
+    # only abstract nodes are claimable during planning — the tree grows fully first
+    claim = client.post("/claim", json={"agent_id": "t1"}).json()
+    assert claim["node"]["id"] == "root" and not claim["node"]["tool"]
+    d = client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+    assert d.status_code == 200, d.text
+    got = client.get(f"/runs/{run_id}").json()
+    assert got["plan_ready"] is True
+
+    # tool work is held at the checkpoint until the user approves the plan
+    assert client.post("/claim", json={"agent_id": "t2"}).json() == {"node": None}
+    assert client.post(f"/runs/{run_id}/go").json() == {"ok": True}
+    got = client.post("/claim", json={"agent_id": "t2"}).json()
+    assert got["node"]["tool"] == "web_search"           # bottom-up: leaves first
+    assert client.post(f"/runs/{run_id}/go").status_code == 409     # idempotent guard
+
+
+def test_templates_skip_the_checkpoint_and_head_owns_the_answer(client):
+    run_id = client.post("/runs", json={"nodes": [
+        {"id": "root", "intent": "head question"},
+        {"id": "root.1", "intent": "gather", "tool": "web_search", "depth": 1,
+         "args": {"query": "q", "max_results": 3}, "parent": "root",
+         "success_predicate": "hits"},
+        {"id": "root.2", "intent": "write", "tool": "llm", "depth": 1,
+         "deps": ["root.1"], "parent": "root",
+         "success_predicate": "answers the question"}]}).json()["run_id"]
+    assert client.get(f"/runs/{run_id}").json()["phase"] == "executing"
+
+    assert client.post("/claim", json={"agent_id": "a"}).json()["node"]["id"] == "root.1"
+    client.post(f"/runs/{run_id}/nodes/root.1/result", json={
+        "state": "DONE", "result": {"results": [{"url": "u", "page_text": "t"}]}})
+    assert client.post("/claim", json={"agent_id": "a"}).json()["node"]["id"] == "root.2"
+    client.post(f"/runs/{run_id}/nodes/root.2/result",
+                json={"state": "DONE", "result": {"text": "THE HEAD ANSWER"}})
+    got = client.get(f"/runs/{run_id}").json()["nodes"]
+    # the writer's text climbed to the head; the raw search dump stays on its leaf
+    assert got["root"]["result"] == {"text": "THE HEAD ANSWER", "from": "root.2"}
+    assert got["root"]["state"] == "DONE"
+
+    # no writer child: parents keep the classic child-id aggregate
+    run2 = client.post("/runs", json={"nodes": [
+        {"id": "root", "intent": "agg"},
+        {"id": "root.1", "intent": "t1", "tool": "shell", "depth": 1,
+         "args": {"cmd": "true"}, "parent": "root", "success_predicate": "ok"},
+        {"id": "root.2", "intent": "t2", "tool": "shell", "depth": 1,
+         "args": {"cmd": "true"}, "parent": "root", "success_predicate": "ok"}]}).json()["run_id"]
+    for nid in ("root.1", "root.2"):
+        c = client.post("/claim", json={"agent_id": "b"}).json()
+        assert c["node"]["id"] == nid
+        assert client.post(f"/runs/{run2}/nodes/{nid}/result",
+                           json={"state": "DONE", "result": {"rc": 0, "stdout": nid}}
+                           ).status_code == 200
+    root = client.get(f"/runs/{run2}").json()["nodes"]["root"]
+    assert root["state"] == "DONE"
+    assert root["result"] == {"root.1": {"rc": 0, "stdout": "root.1"},
+                              "root.2": {"rc": 0, "stdout": "root.2"}}
+
+
+def test_constraints_roundtrip_and_ride_the_claim_payload(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    r = client.put(f"/runs/{run_id}/constraints",
+                   json={"constraints": ["ignore methodology", "discuss cost"]})
+    assert r.status_code == 200
+    assert r.json()["constraints"] == ["ignore methodology", "discuss cost"]
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["constraints"] == ["ignore methodology", "discuss cost"]
+    assert client.get(f"/runs/{run_id}").json()["constraints"] == ["ignore methodology",
+                                                                    "discuss cost"]
+    assert client.put(f"/runs/{run_id}/constraints",
+                      json={"constraints": [f"c{i}" for i in range(13)]}).status_code == 400
+    assert client.put(f"/runs/{run_id}/constraints",
+                      json={"constraints": []}).json()["constraints"] == []
+
+
+def test_replan_breaks_down_further_during_planning(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.post("/claim", json={"agent_id": "t"})
+    assert client.post(f"/runs/{run_id}/nodes/root/decompose",
+                       json=_intent_children()).status_code == 200
+    # break one leaf down further: back to abstract PENDING, re-claimable by a planner
+    assert client.post(f"/runs/{run_id}/nodes/root.1/replan").status_code == 200
+    n = client.get(f"/runs/{run_id}").json()["nodes"]["root.1"]
+    assert n["tool"] is None and n["state"] == "PENDING"
+    c = client.post("/claim", json={"agent_id": "t2"}).json()
+    assert c["node"]["id"] == "root.1" and not c["node"]["tool"]
+    # replanning a parent removes the whole subtree (release the planner first)
+    client.post(f"/runs/{run_id}/nodes/root.1/redirect",
+                json={"agent_id": "t2", "reason": "finishing the test"})
+    assert client.post(f"/runs/{run_id}/nodes/root/replan").status_code == 200
+    assert set(client.get(f"/runs/{run_id}").json()["nodes"]) == {"root"}
+    # after /go the op is gone — fix & retry takes over
+    assert client.post(f"/runs/{run_id}/go").status_code == 200
+    assert client.post(f"/runs/{run_id}/nodes/root/replan").status_code == 409
+
+
+def test_user_adds_and_edits_branches_during_planning(client):
+    run_id = client.post("/runs", json={"intent": "research x"}).json()["run_id"]
+    client.post("/claim", json={"agent_id": "t"})
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+
+    # add a branch: enters abstract (the LLM planner owns it), claimable at once
+    r = client.post(f"/runs/{run_id}/nodes",
+                    json={"intent": "compare TCO of vLLM vs TGI", "parent": "root"})
+    assert r.status_code == 200 and r.json()["id"] == "root.4"
+    # the convergence invariant was re-pinned: the sink now consumes the new branch
+    sink = client.get(f"/runs/{run_id}").json()["nodes"]["root.3"]
+    assert sink["tool"] == "llm" and set(sink["deps"]) == {"root.1", "root.2", "root.4"}
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is False
+    # edit its instruction before it gets claimed
+    assert client.patch(f"/runs/{run_id}/nodes/root.4",
+                        json={"intent": "compare production TCO of vLLM vs TGI"}) \
+        .status_code == 200
+    c = client.post("/claim", json={"agent_id": "t2"}).json()
+    assert c["node"]["id"] == "root.4" and not c["node"]["tool"]
+    assert c["node"]["intent"].startswith("compare production")
+    # the planner sees its neighbors: parent intent + sibling branches
+    assert c["context"]["parent_intent"] == "research x"
+    assert {s["id"] for s in c["context"]["siblings"]} == {"root.1", "root.2", "root.3"}
+    assert all("intent" in s for s in c["context"]["siblings"])
+    # edge cases: missing parent, empty intent, and everything freezes after /go
+    assert client.post(f"/runs/{run_id}/nodes",
+                       json={"intent": "dangling", "parent": "nope"}).status_code == 404
+    assert client.post(f"/runs/{run_id}/nodes",
+                       json={"intent": "  ", "parent": "root"}).status_code == 400
+    client.post(f"/runs/{run_id}/nodes/root.4/redirect",
+                json={"agent_id": "t2", "reason": "back to the planner pool"})
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is False  # still abstract pending
+    client.post(f"/runs/{run_id}/go")
+    assert client.post(f"/runs/{run_id}/nodes",
+                       json={"intent": "late", "parent": "root"}).status_code == 409
+    assert client.patch(f"/runs/{run_id}/nodes/root.4",
+                        json={"intent": "late"}).status_code == 409
+
+
+def test_result_gated_planner_nodes_are_stripped_and_never_block_the_checkpoint(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.post("/claim", json={"agent_id": "t"})
+    # the model asks for a result-gated re-plan: abstract child deps on a search
+    d = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "read the source", "tool": "web_search",
+         "args": {"query": "q", "max_results": 3}, "deps": [], "success_predicate": "hits"},
+        {"intent": "break the findings down", "deps": [0], "success_predicate": ""}]})
+    assert d.status_code == 200, d.text
+    nodes = client.get(f"/runs/{run_id}").json()["nodes"]
+    # during planning the tool dep is stripped: the abstract child is plannable NOW
+    assert nodes["root.2"]["deps"] == [] and nodes["root.2"]["tool"] is None
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is False
+    c = client.post("/claim", json={"agent_id": "t2"}).json()
+    assert c["node"]["id"] == "root.2"
+    # finish its plan and the checkpoint opens
+    assert client.post(f"/runs/{run_id}/nodes/root.2/decompose",
+                       json={"children": [{"intent": "write", "tool": "llm", "deps": [],
+                                           "success_predicate": "answers"}]}
+                       ).status_code == 200
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is True
+    # legacy shape (tool-gated abstract node created before the strip): exempt, with
+    # the gated refinement happening after /go — it must not hold the checkpoint
+    core.RUNS[run_id]["nodes"]["root.2"].state = core.NodeState.PENDING
+    core.RUNS[run_id]["nodes"]["root.2"].deps = ["root.1"]
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is True

@@ -1,8 +1,16 @@
 """Core: DAG store + validation, approvals, checkpointing (SQLite), exec mediator,
-agent registry (heartbeat/position/phase), persisted event/mailbox log (paper III-B),
+agent registry (heartbeat/position/phase), persisted event log (paper III-B),
 claim leases, tool registry, WebSocket feed, static UI.
 
-Single process; asyncio.Lock makes claims/mutations atomic (scale-out: P-later)."""
+Main loop shapes:
+  POST /runs {intent|nodes}            -> run enters the claimable set
+  POST /claim                          -> atomic ready-leaf handout (Alg-2 routing, locality)
+  POST /runs/{id}/nodes/{nid}/decompose-> validated children (approval-parked or applied)
+  POST /runs/{id}/exec                 -> sandbox tool call (approval-parked or executed)
+  POST /runs/{id}/nodes/{nid}/result   -> DONE (settles parents) / FAILED (repair loop, then escalate)
+Approvals hold runs steady; the budget governor (max_llm_calls/max_seconds) terminates them.
+Approvals gate the UI, they are NOT an auth boundary: bind to localhost in compose if
+anything untrusted shares the LAN. Single process; asyncio.Lock makes mutations atomic."""
 import asyncio
 import json
 import sqlite3
@@ -73,19 +81,28 @@ class Store:
             self.db.execute("ALTER TABLE approvals ADD COLUMN kind TEXT DEFAULT 'exec'")
         except sqlite3.OperationalError:
             pass
+        for col, ddl in (("phase", "ALTER TABLE runs ADD COLUMN phase TEXT DEFAULT 'executing'"),
+                         ("constraints", "ALTER TABLE runs ADD COLUMN constraints TEXT DEFAULT '[]'")):
+            try:  # migration for DBs created before the plan-checkpoint fields
+                self.db.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         self.db.commit()
 
     def save_run(self, run: Dict[str, Any]) -> None:
-        self.db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?)",
+        self.db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?)",
                         (run["id"], run["created"], run["intent"],
                          json.dumps({k: v.model_dump() for k, v in run["nodes"].items()}),
-                         json.dumps(run["stats"])))
+                         json.dumps(run["stats"]),
+                         run.get("phase", "executing"),
+                         json.dumps(run.get("constraints", []))))
         self.db.commit()
 
     def load_runs(self) -> Dict[str, Dict[str, Any]]:
         out = {}
-        for rid, created, intent, nodes, stats in self.db.execute("SELECT * FROM runs"):
+        for rid, created, intent, nodes, stats, phase, cons in self.db.execute("SELECT * FROM runs"):
             out[rid] = {"id": rid, "created": created, "intent": intent,
+                        "phase": phase or "executing", "constraints": json.loads(cons or "[]"),
                         "nodes": {k: Node(**v) for k, v in json.loads(nodes).items()},
                         "stats": json.loads(stats)}
         return out
@@ -163,6 +180,36 @@ def _ancestors(run: Dict[str, Any], nid: str) -> set:
     return out
 
 
+def _subtree(run: Dict[str, Any], nid: str) -> List[str]:
+    """nid plus every node below it via PARENT links (decomposition tree),
+    which is the relation replan deletes along — dep edges ignore parents."""
+    out, frontier = [], [nid]
+    while frontier:
+        cur = frontier.pop()
+        kids = [n.id for n in run["nodes"].values() if n.parent == cur]
+        out += kids
+        frontier += kids
+    return out
+
+
+def _plan_ready(run: Dict[str, Any]) -> bool:
+    """Planning checkpoint reached: every abstract node plannable NOW has been
+    decomposed down to atomic tool leaves. Abstract nodes gated behind not-yet-run
+    tool deps can't be worked during planning (their context arrives with the
+    results) — they refine after /go and must NOT block the checkpoint."""
+    if run.get("phase") != "planning":
+        return False
+    nodes = run["nodes"]
+    for n in nodes.values():
+        if n.tool or n.state not in (NodeState.PENDING, NodeState.RUNNING,
+                                     NodeState.REPAIRING):
+            continue
+        gated = any(nodes[d].tool for d in n.deps if d in nodes)
+        if not gated:
+            return False
+    return True
+
+
 def _pending_approvals(run_id: str) -> set:
     return {a["node_id"] for a in store.approvals("pending") if a["run_id"] == run_id}
 
@@ -189,6 +236,9 @@ async def _state(run_id: str) -> None:
     await _broadcast({"type": "state", "run_id": run_id,
                       "nodes": {k: v.model_dump(mode="json") for k, v in run["nodes"].items()},
                       "stats": run["stats"], "active": _active(run),
+                      "phase": run.get("phase", "executing"),
+                      "constraints": run.get("constraints", []),
+                      "plan_ready": _plan_ready(run),
                       "pending": sorted(_pending_approvals(run_id))})
 
 
@@ -208,14 +258,21 @@ def _fail_cascade(run: Dict[str, Any], nid: str, hint: str, state: NodeState) ->
 
 
 def _settle(run: Dict[str, Any], nid: str) -> None:
-    """After DONE: complete parents whose children are all DONE (bottom-up)."""
+    """After DONE: complete parents whose children are all DONE (bottom-up).
+    The parent takes its writer child's text (the sink = most deps), so the train
+    of thought climbs: raw results stay on leaves, summaries rise level by level,
+    and the head node ends holding the final answer itself."""
     node = run["nodes"][nid]
     if node.parent and node.parent in run["nodes"]:
         p = run["nodes"][node.parent]
         kids = [n for n in run["nodes"].values() if n.parent == p.id]
         if kids and all(k.state == NodeState.DONE for k in kids):
             p.state = NodeState.DONE
-            p.result = {k.id: k.result for k in kids}
+            writer = max((k for k in kids
+                          if isinstance(k.result, dict) and k.result.get("text")),
+                         key=lambda k: len(k.deps), default=None)
+            p.result = ({"text": writer.result["text"], "from": writer.id}
+                        if writer else {k.id: k.result for k in kids})
             _settle(run, p.id)
 
 
@@ -365,6 +422,16 @@ def _build_children(nodes: Dict[str, Node], nid: str,
 
 def _apply_decompose(run: Dict[str, Any], nid: str, children: List[Node]) -> List[str]:
     """Validate as a patch and apply; parent -> WAITING. Caller holds the lock."""
+    if run.get("phase") == "planning":
+        # plan-first: an abstract child must be plannable NOW, from neighbor
+        # context — result-gated planning (deps on tools) waits for /go,
+        # so strip tool deps off abstract children
+        for c in children:
+            if c.tool:
+                continue
+            c.deps = [d for d in c.deps
+                      if not next((x.tool for x in children if x.id == d),
+                                  run["nodes"].get(d) and run["nodes"][d].tool)]
     patch = Patch(ops=[{"op": "add_node", "node": c.model_dump()} for c in children],
                   reason=f"decompose {nid}")
     new_nodes, errs = apply_patch(run["nodes"], patch, TOOLS, POLICY["max_depth"],
@@ -483,8 +550,11 @@ async def create_run(body: RunIn) -> Dict[str, Any]:
         nodes = {"root": Node(id="root", intent=body.intent.strip())}
     else:
         raise HTTPException(400, ["provide either intent or nodes (template DAG)"])
+    # intent runs are LLM-decomposed: plan first (checkpoint), user-approved /go
+    # starts the bottom-up execution. Template DAGs are pre-planned: run at once.
     run = {"id": uuid.uuid4().hex[:8], "created": time.time(),
            "intent": body.intent or f"template ({len(nodes)} nodes)", "nodes": nodes,
+           "phase": "executing" if body.nodes else "planning", "constraints": [],
            "stats": {"llm_calls": 0, "execs": 0, "approvals": 0, "patches": 0}}
     async with _lock:
         RUNS[run["id"]] = run
@@ -498,7 +568,8 @@ async def create_run(body: RunIn) -> Dict[str, Any]:
 @app.get("/runs")
 def list_runs() -> List[Dict[str, Any]]:
     return [{"id": r["id"], "intent": r["intent"], "created": r["created"],
-             "active": _active(r),
+             "active": _active(r), "phase": r.get("phase", "executing"),
+             "constraints": r.get("constraints", []), "plan_ready": _plan_ready(r),
              "states": {s.value: sum(1 for n in r["nodes"].values() if n.state == s)
                         for s in NodeState}} for r in sorted(RUNS.values(), key=lambda x: -x["created"])]
 
@@ -509,9 +580,154 @@ def get_run(run_id: str) -> Dict[str, Any]:
     if not run:
         raise HTTPException(404, "unknown run")
     return {"id": run["id"], "intent": run["intent"], "active": _active(run),
+            "phase": run.get("phase", "executing"),
+            "constraints": run.get("constraints", []), "plan_ready": _plan_ready(run),
             "nodes": {k: v.model_dump(mode="json") for k, v in run["nodes"].items()},
             "stats": run["stats"], "policy": POLICY,
             "pending": sorted(_pending_approvals(run_id))}
+
+
+class ConstraintIn(BaseModel):
+    constraints: List[str]
+
+
+class AddedNode(BaseModel):
+    intent: str
+    parent: str = "root"
+
+
+class NodeUpdate(BaseModel):
+    intent: str
+
+
+@app.post("/runs/{run_id}/nodes")
+async def add_node(run_id: str, body: AddedNode) -> Dict[str, Any]:
+    """User adds a branch at the planning checkpoint. It enters ABSTRACT (no tool):
+    an agent's LLM claims it and decomposes it against its neighbor context —
+    the user's rough idea becomes a fleshed-out sub-tree."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    if run.get("phase") != "planning":
+        raise HTTPException(409, "tree edits only at the planning checkpoint")
+    intent = " ".join(body.intent.split())[:300]
+    if not intent:
+        raise HTTPException(400, "empty intent")
+    if body.parent not in run["nodes"]:
+        raise HTTPException(404, f"unknown parent node {body.parent!r}")
+    if len(run["nodes"]) >= POLICY["max_nodes"]:
+        raise HTTPException(400, f"node cap reached ({POLICY['max_nodes']})")
+    async with _lock:
+        i = 1
+        while f"{body.parent}.{i}" in run["nodes"]:
+            i += 1
+        nid = f"{body.parent}.{i}"
+        p = run["nodes"][body.parent]
+        run["nodes"][nid] = Node(id=nid, intent=intent, deps=list(p.deps),
+                                 depth=p.depth + 1, parent=body.parent)
+        # keep the convergence invariant: the parent's sink (writer with most
+        # deps) must consume EVERY sibling, user-added ones included
+        sibs = [n for n in run["nodes"].values() if n.parent == body.parent]
+        sink = max((n for n in sibs if n.tool == "llm" and n.deps),
+                   key=lambda n: len(n.deps), default=None)
+        if sink and nid not in sink.deps:
+            sink.deps = [n.id for n in sibs if n.id != sink.id]
+        store.save_run(run)
+    await _event(run_id, "info", "plan", "user", "core",
+                 f"branch added by user: {nid} — {intent[:60]}")
+    await _state(run_id)
+    return {"ok": True, "id": nid}
+
+
+@app.patch("/runs/{run_id}/nodes/{nid}")
+async def update_node(run_id: str, nid: str, body: NodeUpdate) -> Dict[str, Any]:
+    """User rewrites a node's instruction while the plan is still open."""
+    run = RUNS.get(run_id)
+    if not run or nid not in run["nodes"]:
+        raise HTTPException(404, "unknown run or node")
+    if run.get("phase") != "planning":
+        raise HTTPException(409, "tree edits only at the planning checkpoint")
+    n = run["nodes"][nid]
+    if n.state not in (NodeState.PENDING, NodeState.WAITING):
+        raise HTTPException(409, f"cannot edit {nid} in state {n.state.value}")
+    intent = " ".join(body.intent.split())[:300]
+    if not intent:
+        raise HTTPException(400, "empty intent")
+    n.intent = intent
+    store.save_run(run)
+    await _event(run_id, "info", "plan", "user", "core",
+                 f"node {nid} reworded: {intent[:60]}")
+    await _state(run_id)
+    return {"ok": True}
+
+
+@app.put("/runs/{run_id}/constraints")
+async def set_constraints(run_id: str, body: ConstraintIn) -> Dict[str, Any]:
+    """User plan feedback (the 'ignore methodology / discuss X' box): stored on the
+    run and injected into every decomposition and synthesis prompt from then on."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    clean = []
+    for c in body.constraints:
+        c = " ".join(str(c).split())[:300]
+        if c and c not in clean:
+            clean.append(c)
+    if len(clean) > 12:
+        raise HTTPException(400, "too many constraints (max 12)")
+    run["constraints"] = clean
+    store.save_run(run)
+    store.log(run_id, "info", "plan", "user", "core",
+              "constraints set: " + ("; ".join(clean) if clean else "(none)"))
+    await _state(run_id)
+    return {"ok": True, "constraints": clean}
+
+
+@app.post("/runs/{run_id}/go")
+async def go(run_id: str) -> Dict[str, Any]:
+    """User approved the plan: execution starts bottom-up from the leaves."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    if run.get("phase") != "planning":
+        raise HTTPException(409, "run is not at the planning checkpoint")
+    run["phase"] = "executing"
+    store.save_run(run)
+    store.log(run_id, "info", "plan", "user", "core",
+              f"plan approved ({len(run['nodes'])} nodes, "
+              f"{'ready' if _plan_ready(run) else 'partial'}) — execution starts")
+    await _state(run_id)
+    return {"ok": True}
+
+
+@app.post("/runs/{run_id}/nodes/{nid}/replan")
+async def replan(run_id: str, nid: str) -> Dict[str, Any]:
+    """'Break this down further': during planning, turn a node back into an
+    abstract planner task (deleting its subtree) so an agent re-decomposes it
+    against the current constraints."""
+    run = RUNS.get(run_id)
+    if not run or nid not in run["nodes"]:
+        raise HTTPException(404, "unknown run or node")
+    if run.get("phase") != "planning":
+        raise HTTPException(409, "replan only at the planning checkpoint "
+                                 "(after /go, use fix & retry instead)")
+    async with _lock:
+        kids = _subtree(run, nid)
+        if any(run["nodes"][d].state == NodeState.RUNNING for d in kids):
+            raise HTTPException(409, "a planner is working inside this subtree — wait")
+        n = run["nodes"][nid]
+        if n.state not in (NodeState.PENDING, NodeState.WAITING):
+            raise HTTPException(409, f"cannot replan {nid} in state {n.state.value}")
+        for d in kids:
+            del run["nodes"][d]
+        n.state, n.tool, n.args, n.result, n.hint = NodeState.PENDING, None, {}, None, ""
+        # same rule as _apply_decompose: plannable NOW (tool deps wait for /go)
+        n.deps = [d for d in n.deps if d in run["nodes"] and not run["nodes"][d].tool]
+        store.save_run(run)
+    await _event(run_id, "info", "plan", "user", "core",
+                 f"replan: {nid} goes back to the planner ({len(kids)} descendants removed)")
+    await _state(run_id)
+    return {"ok": True}
 
 
 @app.get("/runs/{run_id}/events")
@@ -555,7 +771,12 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
                           f"run terminated: {breach}")
                 terminated.append(run["id"])
                 continue
-            candidates += [(run, n) for n in ready_nodes(run["nodes"])]
+            cands = ready_nodes(run["nodes"])
+            if run.get("phase") == "planning":
+                # plan-first: only abstract nodes (further decomposition) are
+                # claimable; tool work waits for the user's /go
+                cands = [n for n in cands if not n.tool]
+            candidates += [(run, n) for n in cands]
         if candidates:
             # Algorithm 2 routing: exclude nodes where this agent is in the
             # visited set (it redirected them away); if nothing remains, ⊥
@@ -602,6 +823,12 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
             siblings = [{"id": s.id, "state": s.state.value}
                         for s in run["nodes"].values()
                         if s.parent == first.parent and s.id != first.id]
+            parent = run["nodes"].get(first.parent) if first.parent else None
+            context = {"parent_intent": parent.intent if parent else "",
+                       "run_intent": run["intent"],
+                       "siblings": [{"id": s.id, "intent": s.intent, "tool": s.tool}
+                                    for s in run["nodes"].values()
+                                    if s.parent == first.parent and s.id != first.id]}
     for rid in terminated:
         await _state(rid)
     if not picked:
@@ -611,6 +838,7 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
     return {"run_id": run["id"], "node": first.model_dump(mode="json"),
             "nodes": [n.model_dump(mode="json") for n in nodes],
             "inputs": inputs, "siblings": siblings, "tools": TOOLS,
+            "constraints": run.get("constraints", []), "context": context,
             "max_depth": POLICY["max_depth"]}
 
 

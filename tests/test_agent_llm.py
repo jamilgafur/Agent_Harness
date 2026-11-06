@@ -1,5 +1,5 @@
 """Agent-side material formatting + upward traversal for the virtual `llm` tool."""
-from harness.agent import Agent, _deepen_branches, _force_synthesis, _llm_ok, _material
+from harness.agent import Agent, _deepen_branches, _force_synthesis, _llm_ok, _material, _sources
 
 
 def test_material_formats_search_hits():
@@ -25,6 +25,48 @@ def test_llm_ok_requires_substantive_text():
     assert _llm_ok("Structured pruning removes entire channels or filters from a network.")
 
 
+def test_sources_footers_dedupe_and_reach_into_aggregates():
+    leaf = {"results": [{"url": "https://a", "page_text": "t"},
+                        {"url": "https://a", "page_text": "t"},
+                        {"url": "https://b", "page_text": "t"}]}
+    aggregate = {"root.1.1": leaf, "root.1.2": {"text": "summary"}}
+    got = _sources({"root.1": aggregate})
+    assert got.startswith("\n\nSources:\n")
+    assert got.count("https://a") == 1 and "https://b" in got
+    assert _sources({"x": {"text": "no urls here"}}) == ""
+
+
+def test_sources_recover_links_from_climbing_branch_summaries():
+    # parents hold {"text": ..., "from": ...} now — the head only sees prose,
+    # so its footer must be mined back out of the branch summaries' own footers
+    branch = {"text": "Prose answer.\n\nSources:\n- https://a/p\n- https://b/q",
+              "from": "root.1.4"}
+    got = _sources({"root.1": branch, "root.2": {"text": "no links", "from": "root.2.2"}})
+    assert "- https://a/p" in got and "- https://b/q" in got
+
+
+def test_judge_gather_tools_is_deterministic_and_never_calls_the_llm():
+    class BoomLlm:
+        def chat_json(self, *a, **k):
+            raise AssertionError("the LLM must not judge gather results")
+
+    a = object.__new__(Agent)
+    a.llm = BoomLlm()
+    node = {"tool": "web_search", "success_predicate": "relevant hits", "intent": "x"}
+    assert a.judge(node, {"results": [{"url": "u", "page_text": "…"}]})
+    assert a.judge(node, {"content": "page text"})
+    assert not a.judge(node, {"results": []})
+    assert not a.judge(node, {"rc": -5, "stderr": "fetch failed"})
+
+
+def test_material_prefers_sibling_summaries_in_aggregate_results():
+    aggregate = {"root.2.1": {"results": [{"title": "raw", "url": "u", "snippet": "s"}]},
+                 "root.2.4": {"text": "branch summary prose"}}
+    got = _material({"root.2": aggregate})
+    assert "branch summary prose" in got
+    assert '"results"' not in got          # raw leaf dumps stay below ─ only summaries rise
+
+
 def test_upstream_walks_ancestors_via_deps_and_parents():
     class FakeResp:
         def json(self):
@@ -44,6 +86,113 @@ def test_upstream_walks_ancestors_via_deps_and_parents():
     a.http = FakeHttp()
     got = a._upstream("r", {"id": "root.2", "parent": "root", "deps": ["root.1"]})
     assert set(got) == {"root.1", "root"}          # ancestors only, DONE-with-result only
+
+
+def test_decompose_prompt_carries_user_constraints():
+    captured = {}
+
+    class FakeLlm:
+        calls = 0
+
+        def chat_json(self, sys_prompt, user_prompt):
+            captured["prompt"] = user_prompt
+            return {"children": [{"intent": "s", "tool": "web_search",
+                                  "args": {"query": "q"}, "deps": [],
+                                  "success_predicate": "hits"}]}
+
+    a = object.__new__(Agent)
+    a.llm = FakeLlm()
+    out = a.decompose({"id": "root", "intent": "t", "depth": 0, "hint": ""}, {},
+                      {"web_search": {"required": ["query", "max_results"]}}, 17,
+                      ["ignore methodology"])
+    assert "ignore methodology" in captured["prompt"]
+    assert any(c.get("tool") == "llm" for c in out["children"])   # sink pinned on
+
+
+def test_decompose_prompt_names_neighbor_branches():
+    captured = {}
+
+    class FakeLlm:
+        calls = 0
+
+        def chat_json(self, sys_p, user_p):
+            captured["prompt"] = user_p
+            return {"children": [{"intent": "s", "tool": "web_search",
+                                  "args": {"query": "q"}, "deps": [],
+                                  "success_predicate": "hits"}]}
+
+    a = object.__new__(Agent)
+    a.llm = FakeLlm()
+    a.decompose({"id": "root.4", "intent": "compare TCO of engines", "depth": 1, "hint": ""},
+                {}, {"web_search": {"required": ["query", "max_results"]}}, 17, [],
+                {"parent_intent": "research paper on serving",
+                 "run_intent": "research paper on serving",
+                 "siblings": [{"id": "root.2", "intent": "quantization basics",
+                               "tool": None}]})
+    p = captured["prompt"]
+    assert "quantization basics" in p and "research paper on serving" in p
+
+
+# ---------- head-answer assembly (deterministic sections, 3b-safe model asks) ----------
+class _WriterLlm:
+    def __init__(self):
+        self.replies = []
+
+    def chat(self, sys_p, user_p, json_mode=False):
+        self.replies.append(user_p)
+        if "introduction" in user_p:
+            return "INTRO SENTENCES."
+        if "concluding" in user_p:
+            return "BOTTOM LINE SENTENCES."
+        return "GENERIC ANSWER."
+
+
+class _RunHttp:
+    def get(self, path):
+        assert path == "/runs/r"
+
+        class R:
+            def json(self):
+                return {"nodes": {
+                    "root":   {"intent": "the run question"},
+                    "root.1": {"intent": "branch one intent"},
+                    "root.2": {"intent": "branch two intent"},
+                }}
+        return R()
+
+
+def test_head_writer_assembles_sections_from_branch_summaries():
+    a = object.__new__(Agent)
+    a.http = _RunHttp()
+    a.llm = _WriterLlm()
+    inputs = {
+        "root.1": {"text": "branch one prose with specifics.\n\nSources:\n- https://x"},
+        "root.2": {"text": "branch two prose."},
+    }
+    t = a._write_answer("r", {"id": "root.4", "parent": "root", "intent": "sink"},
+                        inputs, "MATERIAL", [])
+    assert t.startswith("# the run question")
+    assert "INTRO SENTENCES." in t and "## Bottom line\n\nBOTTOM LINE SENTENCES." in t
+    assert "## branch one intent\n\nbranch one prose with specifics." in t
+    assert "## branch two intent\n\nbranch two prose." in t
+    assert "https://x" not in t            # per-branch link tails stripped before assembly
+    assert len(a.llm.replies) == 2         # intro + outro only: body is not re-generated
+
+
+def test_branch_writer_and_thin_head_use_plain_synthesis():
+    a = object.__new__(Agent)
+    a.llm = _WriterLlm()          # replies beyond the first two => "GENERIC ANSWER."
+    t = a._write_answer("r", {"id": "root.1.2", "parent": "root.1", "intent": "t"},
+                        {"root.1.1": {"text": "x"}}, "MATERIAL", ["discuss cost"])
+    assert t == "GENERIC ANSWER."
+    assert "discuss cost" in a.llm.replies[0]
+
+    a2 = object.__new__(Agent)
+    a2.http = _RunHttp()
+    a2.llm = _WriterLlm()
+    t2 = a2._write_answer("r", {"id": "root.4", "parent": "root", "intent": "t"},
+                          {"root.1": {"text": "only one section"}}, "MATERIAL", [])
+    assert t2 == "GENERIC ANSWER."        # <2 sections: falls back to a single chat call
 
 
 def _search(i):

@@ -6,14 +6,17 @@ workspace = "/workspace"
 data_dir = "/data"
 
 [policy]
-max_depth = 17
-max_nodes = 300
-max_llm_calls = 500
-max_seconds = 7200
-max_repairs = 3
-confirm_actions = true
-auto_approve = ["web_search", "http_fetch", "read_file", "list_dir", "llm"]
-approve_dag_edits = false
-claim_lease_seconds = 120
+# --- budgets: the governor terminates a run (work kept) when any are crossed ---
+max_depth = 17          # decomposition tree cap
+max_nodes = 300         # per run, validated on every patch
+max_llm_calls = 500     # per run; agent reports calls on every result
+max_seconds = 7200      # wall clock per run
+max_repairs = 3         # FAILED attempts before a node cascades to ESCALATED
+# --- gates: the Claude-Code-style default is read-only flies, mutations ask ---
+confirm_actions = true                                                  # tools NOT in auto_approve park an approval card
+auto_approve = ["web_search", "http_fetch", "read_file", "list_dir", "llm"]  # read-only + synthesis
+approve_dag_edits = false                                               # plans validated server-side; true = eyeball every decomposition
+# --- mesh ---
+claim_lease_seconds = 120   # RUNNING older than this requeues (live-heartbeat agents are exempt)
 heartbeat_seconds = 5
-max_agents = 4
+max_agents = 4              # concurrency gate; run N workers with `docker compose up -d --scale agent=N`

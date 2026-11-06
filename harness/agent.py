@@ -1,8 +1,15 @@
 """Agent worker: claim → execute (approval-gated, via core) → judge → report,
 or decompose abstract nodes via LLM with a validate-and-resubmit repair loop.
 
+Decomposition is shape-pinned deterministically after the model speaks, in this order:
+  chat_json -> cap 4 (slot for sink) -> _force_synthesis (flatten gather chains,
+  ground lone/all-llm plans, one convergence sink) -> _deepen_branches (root-level
+  research plans become abstract-branch trees). The model proposes; these decide.
+
 Communicates per paper III-B: Task (claim), Result (report), Redirect (handoff),
-Heartbeat (phase + position, for the UI agent layer and the claim lease).
+Heartbeat (phase + position, keeps the lease alive during long LLM calls).
+
+Debug a stuck worker live: `docker compose kill -s USR1 agent` -> traceback in logs.
 
 Runnable with zero LLM calls when nodes carry auto-approved tools and no
 success_predicate (template DAGs) — that path is the offline acceptance test.
@@ -10,11 +17,12 @@ success_predicate (template DAGs) — that path is the offline acceptance test.
 import faulthandler
 import json
 import os
+import re
 import signal
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -59,18 +67,26 @@ chain a child onto another ONLY when it truly needs that child's output.
 Large/broad tasks (papers, surveys, \"main approaches to X\"): FIRST split into 2-3 abstract
 branch children (tool=null, one per subtopic/section) plus ONE llm child dep-ing on ALL of
 them — branch children will decompose further by these same rules (search leaves, an llm
-summary per branch), answers flowing up the tree."""
+summary per branch), answers flowing up the tree.
+If the prompt lists neighboring branches, split work that COMPLEMENTS them — never duplicate
+a search or subtopic a neighbor already owns (neighbor context is what keeps branches independent)."""
 
-SYNTH_SYS = """You write concise, accurate answers for the user based ONLY on the material
-provided from other DAG branches. Structure it simply (short paragraphs or bullets).
+SYNTH_SYS = """You write grounded, specific answers for the user based ONLY on the material
+provided from other DAG branches. Match the depth the task asks for: a paper,
+report or survey gets full structured sections; a "tell me about" gets a compact brief.
+KEEP THE CONCRETE SPECIFICS — numbers, names, mechanisms, dates. Specifics are what
+make an answer useful; vague paraphrases ("it improves efficiency") are failure.
+Ground every claim in a page that was actually READ (page_text present in the
+material) and cite that page's URL in parentheses when you use it.
 If the material is thin or missing, say what is missing at the end instead of inventing."""
 
 JUDGE_SYS = """You judge whether a tool execution satisfied the success predicate.
 Reply with JSON only: {"ok": true|false, "why": "short reason"}"""
 
 
-def _material(inputs: Dict[str, Any], limit: int = 3500) -> str:
-    """Render dep results into readable material for the synthesis prompt."""
+def _material(inputs: Dict[str, Any], limit: int = 6500) -> str:
+    """Render dep results into readable material for the synthesis prompt.
+    Generous limit: the head must see full branch summaries, not clips."""
     parts = []
     for nid, res in inputs.items():
         if res is None:
@@ -84,6 +100,13 @@ def _material(inputs: Dict[str, Any], limit: int = 3500) -> str:
             body = str(res["text"])
         elif isinstance(res, dict) and "content" in res:
             body = str(res["content"])
+        elif isinstance(res, dict) and any(isinstance(x, dict) and x.get("text")
+                                           for x in res.values()):
+            # aggregate parent result: prefer the children's synthesis texts —
+            # that's the train of thought climbing up, not the raw leaves
+            body = "\n\n".join(f"── {k} ──\n{x['text']}"
+                               for k, x in res.items()
+                               if isinstance(x, dict) and x.get("text"))
         else:
             body = json.dumps(res, default=str)[:600]
         parts.append(f"[from {nid}]\n{body}")
@@ -95,6 +118,28 @@ def _llm_ok(text: str) -> bool:
     LLM-judging prose against model-written predicates was brittle (false 'unmet'
     verdicts escalated whole runs); success_predicate stays as guidance only."""
     return bool(text) and len(text) >= 40
+
+
+def _sources(inputs: Dict[str, Any], limit: int = 12) -> str:
+    """Deterministic citation footer: the URLs the material actually came from —
+    raw search hits AND the footers of climbing branch summaries (parents hold
+    text, not dumps, so links must also be read back out of the prose)."""
+    urls: List[str] = []
+
+    def collect(v: Any) -> None:
+        if isinstance(v, dict):
+            for h in v.get("results") or []:
+                if isinstance(h, dict) and h.get("url"):
+                    urls.append(h["url"])
+            for x in v.values():
+                collect(x)
+        elif isinstance(v, str) and "http" in v:
+            urls.extend(re.findall(r"https?://[^\s)\]]+", v))
+
+    for v in inputs.values():
+        collect(v)
+    seen = [u.rstrip(".,") for u in dict.fromkeys(urls)][:limit]
+    return "\n\nSources:\n" + "\n".join(f"- {u}" for u in seen) if seen else ""
 
 
 GATHER_TOOLS = ("web_search", "http_fetch")
@@ -130,7 +175,7 @@ def _force_synthesis(children: List[Dict[str, Any]], intent: str) -> List[Dict[s
             kids[0].update({"tool": "web_search",
                             "args": {"query": kids[0]["intent"][:300]},
                             "success_predicate": "relevant hits returned"})
-            kids.append({"intent": f"synthesize the answer: {intent[:70]}",
+            kids.append({"intent": f"write the answer from the branches: {intent[:52]}",
                          "tool": "llm", "args": {}, "deps": [0],
                          "success_predicate": "answers the parent task from the gathered material"})
             return kids
@@ -147,7 +192,7 @@ def _force_synthesis(children: List[Dict[str, Any]], intent: str) -> List[Dict[s
         return kids
     syn = next((i for i, c in enumerate(kids) if c.get("tool") == "llm"), None)
     if syn is None:
-        kids.append({"intent": f"synthesize the answer: {intent[:70]}",
+        kids.append({"intent": f"write the answer from the branches: {intent[:52]}",
                      "tool": "llm", "args": {}, "deps": list(range(n)),
                      "success_predicate": "answers the parent task from the gathered material"})
         return kids
@@ -222,13 +267,25 @@ class Agent:
 
     # ---------- LLM-assisted pieces ----------
     def decompose(self, node: Dict[str, Any], inputs: Dict[str, Any],
-                  tools: Dict[str, Any], max_depth: int) -> Optional[Dict[str, Any]]:
+                  tools: Dict[str, Any], max_depth: int,
+                  constraints: Optional[List[str]] = None,
+                  context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         spec = "; ".join(f"{name}(args: {', '.join(s['required'])})"
                          for name, s in tools.items())
         # bound dep results: one fat search dump must not blow the model's ctx
         brief = {k: json.dumps(v, default=str)[:600] for k, v in inputs.items()}
+        sibs = "; ".join(f"{s['id']}: {str(s['intent'])[:60]}"
+                         for s in (context or {}).get("siblings", [])[:8])
         prompt = (f"Parent task: {node['intent']}\nDepth {node['depth']} of {max_depth}.\n"
-                  f"Available tools with required args: {spec}\n"
+                  f"User constraints the plan must respect: "
+                  f"{'; '.join(constraints or []) or 'none'}\n"
+                  f"Overall run goal: {str((context or {}).get('run_intent'))[:160]}\n"
+                  + (f"This task sits under branch: "
+                     f"{str(context['parent_intent'])[:120]}\n"
+                     if context and context.get("parent_intent") else "")
+                  + (f"Neighboring branches (do NOT duplicate their work): {sibs}\n"
+                     if sibs else "")
+                  + f"Available tools with required args: {spec}\n"
                   f"Inputs from dependencies: {brief}\n"
                   f"args keys must match the required names exactly (e.g. write_file takes path and content).\n"
                   f"Hint from previous failure: {node.get('hint') or 'none'}")
@@ -243,8 +300,58 @@ class Agent:
         kids = _force_synthesis(kids, node["intent"])
         return {"children": _deepen_branches(kids, node.get("depth", 0))}
 
+    def _write_answer(self, run_id: str, node: Dict[str, Any],
+                      inputs: Dict[str, Any], material: str,
+                      constraints: List[str]) -> str:
+        """Write a node's text. The RUN'S HEAD writer (parent == root, several
+        branch summaries in) is assembled deterministically: intro + Bottom line
+        from the model (small, 3b-safe asks), body = the verified branch summaries
+        verbatim as sections — nothing gets dropped in the funnel and the answer
+        keeps the tree's coverage. Everyone else: a single synthesis call."""
+        pre = (f"User constraints to respect: {'; '.join(constraints)}\n"
+               if constraints else "")
+        if node.get("parent") == "root":
+            rn = self.http.get(f"/runs/{run_id}").json()["nodes"]
+            sections: List[Tuple[str, str]] = []
+            for d, res in inputs.items():
+                if isinstance(res, dict) and res.get("text") and d in rn:
+                    t = re.sub(r"\n+Sources:\n(?:- .+\s*)+$", "", res["text"]).strip()
+                    if t:
+                        sections.append((rn[d]["intent"], t))
+            if len(sections) >= 2:
+                title = rn.get("root", {}).get("intent") or node["intent"]
+                intro = self.llm.chat(
+                    SYNTH_SYS,
+                    pre + f"Write ONLY a 3-4 sentence introduction for a document "
+                          f"titled \"{title}\" — no headings, no lists, prose only.\n"
+                          f"Material from the neighboring nodes:\n{material}",
+                    json_mode=False).strip()
+                outro = self.llm.chat(
+                    SYNTH_SYS,
+                    pre + f"Write ONLY 4-6 concluding sentences comparing the sections "
+                          f"and saying what the reader should take away, for a document "
+                          f"titled \"{title}\" — no headings, prose only.\n"
+                          f"Material from the neighboring nodes:\n{material}",
+                    json_mode=False).strip()
+                parts = [f"# {title}"]
+                if intro:
+                    parts.append(intro)
+                parts += [f"## {s}\n\n{t}" for s, t in sections]
+                if outro:
+                    parts.append(f"## Bottom line\n\n{outro}")
+                return "\n\n".join(parts)
+        return self.llm.chat(
+            SYNTH_SYS,
+            pre + f"Task: {node['intent']}\n"
+                  f"Material from the neighboring nodes:\n{material}",
+            json_mode=False).strip()
+
     def judge(self, node: Dict[str, Any], exec_result: Dict[str, Any]) -> bool:
         pred = node.get("condition") or node.get("success_predicate", "")
+        if node.get("tool") in GATHER_TOOLS:
+            # deterministic, same rationale as _llm_ok: page_text makes the payload
+            # big enough that a small LLM-judge silently fails good searches
+            return bool(exec_result.get("results") or exec_result.get("content"))
         if not pred:
             return exec_result.get("rc", 0) == 0 if node.get("tool") == "shell" else True
         out = self.llm.chat_json(JUDGE_SYS,
@@ -281,21 +388,21 @@ class Agent:
         calls_before = self.llm.calls
         try:
             if node.get("tool"):
-                if node["tool"] == "llm":   # virtual: synthesize the answer from dep results
-                    self._set("reading upstream", run_id, node["id"])
-                    # traverse upward for full context; direct deps take precedence
-                    material = _material({**self._upstream(run_id, node), **inputs})
+                if node["tool"] == "llm":   # virtual: synthesize from neighbor results
                     self._set("writing", run_id, node["id"])
+                    # train of thought: each writer reads only its own level's
+                    # material (direct deps); branch summaries carry what rose
+                    # from below — see _material's summary-preference rule
+                    material = _material(inputs)
+                    self._set("writing", run_id, node["id"])
+                    cons = claim.get("constraints") or []
                     try:
-                        text = self.llm.chat(
-                            SYNTH_SYS,
-                            f"Task: {node['intent']}\n"
-                            f"Material gathered along the DAG:\n{material}",
-                            json_mode=False).strip()
+                        text = self._write_answer(run_id, node, inputs, material, cons)
                     except Exception as e:
                         self.report(run_id, node, "FAILED", hint=f"llm call failed: {e}",
                                     before=calls_before)
                         return
+                    text += _sources(inputs)
                     res = {"text": text}
                     if _llm_ok(text):
                         self.report(run_id, node, "DONE", result=res, before=calls_before)
@@ -326,7 +433,8 @@ class Agent:
                 self._set("decomposing", run_id, node["id"])
                 # planners travel upward too: full ancestor context, direct deps win
                 ctx = {**self._upstream(run_id, node), **inputs}
-                sub = self.decompose(node, ctx, claim["tools"], claim["max_depth"])
+                sub = self.decompose(node, ctx, claim["tools"], claim["max_depth"],
+                                     claim.get("constraints"), claim.get("context"))
                 errs: Any = "LLM returned nothing usable" if sub is None else None
                 for _ in range(POLICY["max_repairs"]):
                     if errs is None:

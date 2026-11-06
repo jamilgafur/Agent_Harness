@@ -4,14 +4,17 @@
 <meta charset="utf-8">
 <title>Agent Harness</title>
 <style>
-  :root { --bg:#0b0f14; --panel:#12181f; --line:#2b333c; --fg:#e6edf3; --dim:#8b949e; }
-  * { box-sizing:border-box; font:13px/1.45 ui-monospace,SFMono-Regular,monospace; }
+  :root { --bg:#0b0f14; --panel:#12181f; --line:#2b333c; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; }
+  * { box-sizing:border-box; font:13px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  button, input, textarea, .chip, .tab, #log, #detail { font-family:ui-monospace,SFMono-Regular,monospace; }
   body { margin:0; background:var(--bg); color:var(--fg); }
   header { display:flex; gap:14px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; background:var(--panel); position:sticky; top:0; z-index:5; }
   h1 { font-size:15px; margin:0; }
   .chip { padding:2px 9px; border-radius:10px; border:1px solid var(--line); font-size:12px; color:var(--dim); }
   .chip.attn { color:#e3b341; border-color:#e3b341; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:8px 14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:8px 14px; }
+  details.dev summary { cursor:pointer; color:var(--dim); user-select:none; }
+  details.dev[open] summary { margin-bottom:8px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   button, input, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
   button { cursor:pointer; } button:hover { border-color:#58a6ff; }
@@ -50,7 +53,7 @@
   #log .warn { color:#e3b341; } #log .error { color:#f85149; }
   #detail { white-space:pre-wrap; font-size:11.5px; color:var(--dim); max-height:220px; overflow:auto; }
   #modal { position:fixed; inset:0; background:#0009; display:none; align-items:center; justify-content:center; z-index:10; }
-  #modal .card { width:min(720px,92vw); max-height:86vh; overflow:auto; }
+  #modal .card { width:min(720px,92vw); max-height:86vh; overflow:auto; border-radius:12px; box-shadow:0 14px 44px #000b; }
   .agrow { display:flex; gap:10px; flex-wrap:wrap; }
   .acard { border:1px solid var(--line); border-radius:8px; padding:6px 10px; min-width:150px; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
@@ -87,8 +90,9 @@
          overflow:hidden; white-space:nowrap; cursor:pointer; }
   .tab:hover { color:var(--fg); background:#161d26; }
   .tab.on { color:var(--fg); background:var(--bg); border-color:var(--line); position:relative; margin-bottom:-1px; padding-bottom:7px; }
-  .tab .tdot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
-  .tab .tdel { margin-left:10px; padding:0 6px; border-radius:6px; color:#f85149; opacity:.75; font-weight:bold; }
+  .tab .tlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; display:inline-flex; align-items:center; }
+  .tab .tdot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; flex-shrink:0; }
+  .tab .tdel { margin-left:10px; padding:0 6px; border-radius:6px; color:#f85149; opacity:.75; font-weight:bold; flex-shrink:0; }
   .tab .tdel:hover { opacity:1; background:#f8514926; }
   .tab.plus { color:#58a6ff; font-size:15px; padding:6px 11px; }
   .dot.on { background:#3fb950; } .dot.off { background:#555; }
@@ -107,12 +111,15 @@
 
 <div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showOutput()" title="results of the selected run">📄 output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
 
+<div class="panel" id="planbar" style="display:none;margin:8px 14px 0"></div>
 <div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
-<div class="panel agrow" id="agents"></div>
 <div class="panel"><b>Node</b> <span id="detailhint" class="chip">click a node</span><div id="detail"></div></div>
 <div class="panel"><b>Workspace files</b> <button onclick="loadFiles()">refresh</button> <span class="chip" id="filespath"></span>
   <div id="files" class="row" style="max-height:110px;overflow:auto;margin-top:6px"></div></div>
-<div class="panel"><b>Events</b><div id="log"></div></div>
+<details class="panel dev"><summary>🛠 developer — live agents &amp; event log (debug)</summary>
+  <div class="agrow" id="agents" style="margin-bottom:8px"></div>
+  <b>Events</b><div id="log"></div>
+</details>
 
 <div id="modal"><div class="panel card"><div id="modalbody"></div></div></div>
 
@@ -137,7 +144,8 @@ function ws(){
   s.onmessage=ev=>{const m=JSON.parse(ev.data);
     if(m.type==='state'){ const r=ALL[m.run_id]||(ALL[m.run_id]={});
       r.nodes=m.nodes; r.stats=m.stats; r.active=m.active; r.pending=new Set(m.pending||[]);
-      drawTabs(); attention(); if(m.run_id===RUN){draw(); loadFiles();} }
+      r.phase=m.phase; r.constraints=m.constraints||[]; r.plan_ready=m.plan_ready;
+      drawTabs(); planBar(); attention(); if(m.run_id===RUN){draw(); loadFiles();} }
     if(m.type==='agents'){AGENTS=m.agents; drawAgentsPanel(); attention();}
     if(m.type==='log'){ if(m.event.run_id===RUN) logLine(m.event); }
     if(m.type==='approval'){ attention(); const r=ALL[m.approval.run_id];
@@ -153,12 +161,14 @@ async function refreshRuns(){
   const ids=new Set(runs.map(r=>r.id));
   for(const r of runs.slice(0,12)){
     const s=await api('GET',`/runs/${r.id}`);
-    ALL[r.id]={intent:r.intent,created:r.created,nodes:s.nodes,stats:s.stats,active:s.active,pending:new Set(s.pending||[])};
+    ALL[r.id]={intent:r.intent,created:r.created,nodes:s.nodes,stats:s.stats,active:s.active,
+               phase:s.phase,constraints:s.constraints||[],plan_ready:s.plan_ready,
+               pending:new Set(s.pending||[])};
   }
   for(const id of Object.keys(ALL)) if(!ids.has(id)) delete ALL[id];
   if(!RUN&&runs[0]) RUN=runs[0].id;
   if(RUN&&!ALL[RUN]) RUN=runs[0]?runs[0].id:null;
-  drawTabs();
+  drawTabs(); planBar();
   if(RUN){ $('log').innerHTML=''; (await api('GET',`/runs/${RUN}/events`)).forEach(logLine); draw(); fit(); }
   const m=await api('GET','/metrics');
   const t=m.total;
@@ -170,17 +180,88 @@ function drawTabs(){
   $('tabs').innerHTML=Object.entries(ALL).sort((a,b)=>(b[1].created||0)-(a[1].created||0)).map(([rid,r])=>{
     const nodes=Object.values(r.nodes||{}), total=nodes.length, done=nodes.filter(n=>n.state==='DONE').length;
     const pend=(r.pending||new Set()).size, esc_=nodes.filter(n=>n.state==='ESCALATED').length;
-    const color=pend+esc_?'#e3b341':r.active?'#58a6ff':(done===total&&total?'#3fb950':'#8b949e');
+    const color=r.plan_ready?'#e3b341':r.phase==='planning'?'#8b949e':pend+esc_?'#e3b341':r.active?'#58a6ff':(done===total&&total?'#3fb950':'#8b949e');
     return `<span class="tab ${rid===RUN?'on':''}" title="${esc(r.intent||'')}">
-      <span onclick="selRun('${rid}')"><span class="tdot" style="background:${color}"></span>${esc(rid)} · ${esc((r.intent||'').slice(0,26))} · ${done}/${total}${r.active?'':' ✓'}</span>
+      <span class="tlabel" onclick="selRun('${rid}')"><span class="tdot" style="background:${color}"></span>${r.phase==='planning'?'📋 ':''}${esc(rid)} · ${esc((r.intent||'').slice(0,26))} · ${done}/${total}${r.active||r.phase==='planning'?'':' ✓'}</span>
       <span class="tdel" title="delete run" onclick="delRun('${rid}')">✕</span></span>`;
   }).join('');
 }
+
+// ---------- plan checkpoint bar (plan first, user approves, then bottom-up) ----------
+let PLANBAR_KEY='';
+function planBar(){
+  const r=ALL[RUN], bar=$('planbar');
+  if(!r||r.phase!=='planning'){ bar.style.display='none'; PLANBAR_KEY=''; return; }
+  bar.style.display='block';
+  const n=Object.keys(r.nodes||{}).length;
+  const gated=Object.values(r.nodes||{}).filter(x=>!x.tool&&x.state==='PENDING'&&
+     (x.deps||[]).some(d=>(r.nodes[d]||{}).tool)).length;
+  // re-render only when something meaningful changed — the input must keep focus
+  const key=RUN+'|'+n+'|'+gated+'|'+r.plan_ready+'|'+(r.constraints||[]).join('§');
+  if(key===PLANBAR_KEY) return;
+  PLANBAR_KEY=key;
+  const chips=(r.constraints||[]).map((c,i)=>`<span class="chip">${esc(c)} <b style="cursor:pointer;color:#f85149" onclick="delConstraint(${i})" title="remove">✕</b></span>`).join(' ');
+  bar.innerHTML=`<b>📋 planning the run — nothing executes until you approve</b>
+    <span class="chip">${r.plan_ready?`plan ready · ${n} nodes`:`decomposing… ${n} nodes so far`}</span>
+    ${gated?`<span class="chip" title="these branches plan further once their searches return results">${gated} branch${gated===1?'':'es'} refine after results</span>`:''}
+    <div style="margin-top:8px;color:var(--dim);font-size:12px;line-height:1.6">
+      The agents broke your request into atomic steps (the tree below). Review it:
+      add constraints or instructions (e.g. <i>ignore methodology</i>, <i>discuss cost</i>),
+      <b>＋ add branches</b> (top-level or click a node → <b>add a branch here</b>) — nodes you add are
+      reasoned out by the LLM using the neighbor context — ✎ edit intent rewrites any step,
+      ✏️ break down further re-plans it. Then start the work.
+      It runs <b>bottom-up</b>: leaves gather, each writer condenses its neighbours,
+      and the head ends with the answer.</div>
+    <div class="row" style="margin-top:8px">
+      <input id="consinput" placeholder="add a constraint or instruction…" style="flex:1;min-width:220px;padding:6px 10px"
+        onkeydown="if(event.key==='Enter')setConstraints([...(ALL[RUN].constraints||[]),this.value])">
+      <button onclick="setConstraints([...(ALL[RUN].constraints||[]),document.getElementById('consinput').value])">add</button>
+      ${chips}</div>
+    <div class="row" style="margin-top:8px">
+      <button style="border-color:#3fb950;color:#3fb950;padding:7px 18px;font-weight:bold" onclick="goRun()" ${r.plan_ready?'':'disabled title="planners still working…"'}>✔ plan is good — start bottom-up execution</button>
+      <button onclick="addBranch('root')" title="add a new branch under the head — the LLM fleshes it out from what you type">＋ add a top-level branch</button>
+    </div>`;
+}
+async function setConstraints(list){
+  const clean=[...new Set(list.map(x=>String(x).trim()).filter(Boolean))];
+  PLANBAR_KEY='';
+  await api('PUT',`/runs/${RUN}/constraints`,{constraints:clean});
+  planBar();
+}
+async function delConstraint(i){
+  const r=ALL[RUN]; await setConstraints((r.constraints||[]).filter((_,j)=>j!==i));
+}
+async function goRun(){ PLANBAR_KEY=''; await api('POST',`/runs/${RUN}/go`); planBar(); }
+async function replanNode(rid,nid){
+  await api('POST',`/runs/${rid}/nodes/${nid}/replan`);
+  $('detail').textContent=''; $('detailhint').textContent='click a node'; draw();
+}
+function askText(title, placeholder, onok){
+  $('modalbody').innerHTML=`<b>${title}</b>
+    <div class="row" style="margin-top:8px"><input id="askv" placeholder="${esc(placeholder)}" style="flex:1;min-width:260px;padding:6px 10px"></div>
+    <div class="row" style="margin-top:8px"><button id="askok" style="border-color:#58a6ff;color:#58a6ff;padding:6px 16px">ok</button><button onclick="$('modal').style.display='none'">cancel</button></div>`;
+  $('modal').style.display='flex';
+  const v=$('askv'); v.focus();
+  $('askok').onclick=()=>{const t=v.value.trim(); if(t){$('modal').style.display='none'; onok(t);}};
+  v.onkeydown=e=>{if(e.key==='Enter')$('askok').click();};
+}
+function addBranch(parent){
+  askText(`＋ new branch under ${parent} — the LLM will break it down using the neighbor context`,
+          'e.g. compare vLLM vs TGI for production serving', async text=>{
+    await api('POST',`/runs/${RUN}/nodes`,{intent:text,parent});
+  });
+}
+async function editIntent(rid,nid){
+  askText(`✎ edit intent — ${nid}`,'refined instruction', async text=>{
+    await api('PATCH',`/runs/${rid}/nodes/${nid}`,{intent:text});
+    clickNode(nid);
+  });
+}
 async function selRun(rid){
   if(!ALL[rid]||rid===RUN)return;
-  RUN=rid; $('log').innerHTML=''; $('detail').textContent=''; $('detailhint').textContent='click a node';
+  RUN=rid; PLANBAR_KEY=''; $('log').innerHTML=''; $('detail').textContent=''; $('detailhint').textContent='click a node';
   (await api('GET',`/runs/${rid}/events`)).forEach(logLine);
-  drawTabs(); draw(); fit();
+  drawTabs(); planBar(); draw(); fit();
 }
 async function delRun(rid){
   const active=ALL[rid]&&ALL[rid].active;
@@ -230,6 +311,19 @@ function layoutRun(r){
   };
   roots.forEach(rid=>{place(rid,0); nextY+=0.6;});
   nodes.forEach(n=>{ if(!pos[n.id]){ pos[n.id]={x:(n.depth||0)*CW,y:nextY*RH}; nextY++; } });
+  // a node never sits left of its inputs: push each one a column past its deepest
+  // dep — converging "synthesis" wires become forward fan-in lanes, not loops
+  for(let guard=0;guard<8;guard++){
+    let moved=false;
+    for(const n of nodes){
+      const p=pos[n.id]; if(!p) continue;
+      for(const d of n.deps||[]){
+        const dp=pos[d];
+        if(dp&&dp.x+CW>p.x){p.x=dp.x+CW;moved=true;}
+      }
+    }
+    if(!moved)break;
+  }
   return {pos,h:nextY*RH};
 }
 
@@ -246,12 +340,16 @@ function draw(){
   } else {
     const {pos}=layoutRun(r); FOREST[RUN]={pos,yOff:0};
     for(const n of Object.values(r.nodes||{})){
-      for(const d of n.deps||[]){
-        const p0=pos[d],p1=pos[n.id]; if(!p0||!p1)continue;
-        const x0=p0.x+W,yy0=p0.y+H/2,x1=p1.x,yy1=p1.y+H/2,mx=Math.max(60,(x1-x0)/2);
+      const deps=n.deps||[];
+      deps.forEach((d,i)=>{
+        const p0=pos[d],p1=pos[n.id]; if(!p0||!p1)return;
+        const x0=p0.x+W,yy0=p0.y+H/2,x1=p1.x;
+        // fan-in: each incoming dep lands on its own slot of the card's left edge
+        const yy1=p1.y+H*(0.22+0.56*((i+1)/(deps.length+1)));
+        const mx=Math.max(60,Math.abs(x1-x0)/2);
         const ekey=`${d}>${n.id}`, born=!SEEN.has(ekey); SEEN.add(ekey);
         html+=`<path class="edge ${r.nodes[d].state==='DONE'?'done':''} ${born?'born':''}" d="M${x0},${yy0} C${x0+mx},${yy0} ${x1-mx},${yy1} ${x1},${yy1}"/>`;
-      }
+      });
     }
     for(const n of Object.values(r.nodes||{})){
       const p=pos[n.id]; if(!p)continue;
@@ -280,7 +378,8 @@ function draw(){
       const oys=sinks.map(n=>pos[n.id].y);
       const oy=oys.length?(Math.min(...oys)+Math.max(...oys))/2:0;
       FOREST[RUN].pos['$output']={x:ox,y:oy};
-      for(const s of sinks){
+      const headAns=!!(r.nodes['root']&&r.nodes['root'].result&&r.nodes['root'].result.text);
+      for(const s of sinks.filter(s=>s.id!=='root')){   // head wire would span the whole canvas
         const x0=pos[s.id].x+W,yy0=pos[s.id].y+H/2,mx=Math.max(60,(ox-x0)/2);
         html+=`<path class="edge done" d="M${x0},${yy0} C${x0+mx},${yy0} ${ox-mx},${oy+H/2} ${ox},${oy+H/2}"/>`;
       }
@@ -290,7 +389,7 @@ function draw(){
         <circle class="port in" cx="0" cy="${H/2}" r="5"/>
         <text class="icon" x="22" y="${H/2+7}">📄</text>
         <text class="t1" x="54" y="24">RESULTS</text>
-        <text class="sub" x="54" y="44">${produced.length} node${produced.length===1?'':'s'} produced output — click to read</text>
+        <text class="sub" x="54" y="44">${headAns?'the head (leftmost) node holds the answer — click to read':`${produced.length} node${produced.length===1?'':'s'} produced output — click to read`}</text>
       </g></g>`;
     }
   }
@@ -356,13 +455,15 @@ function drawAgentsPanel(){
 async function attention(){
   const pending=await api('GET','/approvals?status=pending');
   const esc_=Object.values(ALL).reduce((s,r)=>s+Object.values(r.nodes||{}).filter(n=>n.state==='ESCALATED').length,0);
-  const total=pending.length+esc_;
+  const planReady=Object.entries(ALL).filter(([_,r])=>r.plan_ready);
+  const total=pending.length+esc_+planReady.length;
   $('attention').textContent=total
-    ? `⚑ ${total} need you — ${pending.length?`next: ${pending[0].node_id}`:'escalated nodes'}`
+    ? `⚑ ${total} need you — ${pending.length?`next: ${pending[0].node_id}`:planReady.length?'a plan is ready to approve':'escalated nodes'}`
     : '⚑ 0 need you';
   $('attention').className='chip'+(total?' attn':'');
   $('attention').style.cursor=total?'pointer':'default';
-  $('attention').onclick=total&&pending.length?()=>openApproval(pending[0]):null;
+  $('attention').onclick=pending.length?()=>openApproval(pending[0])
+    :planReady.length?()=>selRun(planReady[0][0])&&fit() :null;
 }
 
 // ---------- pan / zoom ----------
@@ -392,7 +493,7 @@ function renderResult(v){
   if(v==null) return '';
   if(typeof v!=='object') return String(v);
   if(Array.isArray(v.results)&&v.results.length&&v.results[0]&&v.results[0].url!==undefined)
-    return v.results.map(x=>`• ${x.title||x.url}\n  ${x.url}`).join('\n');
+    return v.results.map(x=>`${x.page_text?'📖 page read:':'🔗 link only:'} ${x.title||x.url}\n  ${x.url}`).join('\n');
   if(v.content!==undefined) return String(v.content).slice(0,1500);
   if(v.stdout!==undefined) return (v.stdout+(v.stderr?'\n[stderr] '+v.stderr:'')).slice(0,1500)||'(empty output)';
   if(v.text) return v.text.slice(0,1500);
@@ -405,33 +506,78 @@ function showHelp(){
   $('modalbody').innerHTML=`<b>how the harness works</b>
   <div style="margin-top:6px;color:var(--dim);font-size:12px;line-height:1.6">
   <b style="color:var(--fg)">1 · Ask.</b> Hit ＋, type one sentence —
-  <i>tell me about…</i>, <i>write a research paper on…</i>, <i>add tests to…</i>.
-  The planner LLM decomposes it into a task <b>DAG</b> you can watch grow.<br>
-  <b style="color:var(--fg)">2 · Watch.</b> Agents (colored chips) ride the wires to nodes they claim.
-  Card rail: <span style="color:#58a6ff">blue</span> running · <span style="color:#3fb950">green</span> done ·
-  <span style="color:#d29922">amber</span> waiting · <span style="color:#f85149">red</span> failed ·
-  <span style="color:#bc4cf0">purple</span> needs a decision. Icons: 🔍 search · 🌐 fetch · 📄 files · ⌘ shell · ✍️ synthesis.<br>
-  <b style="color:var(--fg)">3 · Gate.</b> Read-only work runs unaided; mutations flash — click the card,
-  edit the JSON, approve or reject. Every plan is validated server-side (bad ones bounce for self-repair).<br>
-  <b style="color:var(--fg)">4 · Read.</b> For knowledge tasks the last node is ✍️ <b>synthesis</b>: the model reads
-  everything its DAG ancestors gathered (green dot = output produced) and writes the answer.
-  Open the <b>📄 RESULTS</b> node at the right end of the canvas.<br>
+  <i>tell me about…</i>, <i>write a research paper on…</i>, <i>add tests to…</i>.<br>
+  <b style="color:var(--fg)">2 · Approve the plan.</b> Agents decompose your request into atomic steps
+  (a decision-tree-like DAG you can watch grow) — <b>nothing executes yet</b>. The plan bar lets you add
+  constraints (<i>ignore methodology</i>, <i>discuss cost</i>) and <b>✏️ break down further</b> re-plans any
+  node. Hit <b>✔ start</b> when the plan looks right.<br>
+  <b style="color:var(--fg)">3 · Watch it work bottom-up.</b> Agents (colored chips) ride the wires:
+  leaves gather 🔍🌐, then each ✍️ writer condenses what its neighbours found — the train of thought
+  climbs until the <b>head node holds the final answer</b>. Rail colors: <span style="color:#58a6ff">blue</span> running ·
+  <span style="color:#3fb950">green</span> done · <span style="color:#d29922">amber</span> waiting ·
+  <span style="color:#f85149">red</span> failed · <span style="color:#bc4cf0">purple</span> needs a decision.<br>
+  <b style="color:var(--fg)">4 · Read.</b> Click the <b>head (leftmost) node</b> or the 📄 RESULTS node for the
+  final answer — download, copy, or re-run from there. Every page used was actually read
+  (📖 read vs 🔗 link-only on searches), and sources are listed at the end.<br>
   <b style="color:var(--fg)">Controls</b> — drag background to pan · wheel to zoom · <i>fit all</i> recenters ·
-  click a card for details + its readable result · tabs switch runs · ✕ deletes finished runs.<br>
+  click a card for details + its readable result · tabs switch runs · ✕ deletes a run
+  (active ones ask first). The <b>🛠 developer</b> section below the graph keeps live agents + the event log.<br>
   <b style="color:var(--fg)">Safety rails</b> — per-run budgets (max LLM calls / seconds / depth / nodes) with a
   governor that terminates (keeps work) on breach; full event audit in the log panel and <i>events.jsonl</i>.</div>
   <div class="row" style="margin-top:10px"><button onclick="$('modal').style.display='none'">got it</button></div>`;
   $('modal').style.display='flex';
 }
+let LASTOUT='';
+function headText(r){
+  const nodes=r.nodes||{};
+  const root=nodes['root'];
+  if(root&&root.result&&root.result.text) return root.result.text;   // head owns the answer
+  const consumed=new Set(Object.values(nodes).flatMap(n=>[n.parent,...(n.deps||[])].filter(Boolean)));
+  const texts=Object.values(nodes).filter(n=>!consumed.has(n.id)&&n.result&&n.result.text);
+  if(texts.length) return texts.sort((a,b)=>b.result.text.length-a.result.text.length)[0].result.text;
+  return '';
+}
+// tiny markdown renderer for the assembled head document (escapes first, then marks up)
+function mdLite(s){
+  let h=esc(s||'');
+  h=h.replace(/^### (.*)$/gm,(m,t)=>`<div style="font-weight:bold;margin:10px 0 2px">${t}</div>`);
+  h=h.replace(/^## (.*)$/gm,(m,t)=>`<div style="font-weight:bold;font-size:14.5px;margin:16px 0 4px;color:var(--acc)">${t}</div>`);
+  h=h.replace(/^# (.*)$/gm,(m,t)=>`<div style="font-weight:bold;font-size:17px;margin:4px 0 10px">${t}</div>`);
+  h=h.replace(/\*\*([^*\n]+)\*\*/g,(m,t)=>`<b>${t}</b>`);
+  h=h.replace(/^- (https?:\S+?)(&amp;\S+)?(\s*)$/gm,(m,u,a)=>`• <a href="${u+(a||'')}" target="_blank" rel="noopener" style="color:var(--acc)">${u}${a||''}</a>`);
+  h=h.replace(/^- (?!\s*<a)(.*)$/gm,'• $1');
+  return h;
+}
 function showOutput(){
   const r=ALL[RUN]; if(!r)return;
-  const root=(r.nodes||{})['root'];
-  const body=(root&&root.result!=null)?renderResult(root.result)
-    :renderResult(Object.fromEntries(Object.entries(r.nodes||{}).filter(([k,n])=>n.result!=null).map(([k,n])=>[k,n.result])));
+  const head=headText(r);
+  const body=head||renderResult(Object.fromEntries(Object.entries(r.nodes||{}).filter(([k,n])=>n.result!=null).map(([k,n])=>[k,n.result])));
+  LASTOUT=body||'';
   $('modalbody').innerHTML=`<b>📄 final output — ${esc((r.intent||RUN||'').slice(0,60))}</b>
-    <div style="margin-top:8px;color:var(--fg);white-space:pre-wrap;font-size:13px;line-height:1.55;max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px 16px;background:#0d1420">${esc(body||'nothing produced yet — the run is still working')}</div>
-    <div class="row" style="margin-top:8px"><button onclick="$('modal').style.display='none'">close</button></div>`;
+    <div style="margin-top:8px;color:var(--fg);font-size:13.5px;line-height:1.65;max-height:56vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:16px 20px;background:#0d1420;white-space:pre-wrap">${mdLite(body||'nothing produced yet — the run is still working')}</div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="downloadOutput()" title="save the answer as a markdown file">⬇ download</button>
+      <button onclick="copyOutput(this)" title="copy the answer to the clipboard">⧉ copy</button>
+      ${r.intent?`<button onclick="rerun()" title="start a fresh run with the same request">⟳ run again</button>`:''}
+      <button onclick="$('modal').style.display='none'">close</button></div>`;
   $('modal').style.display='flex';
+}
+function downloadOutput(){
+  const r=ALL[RUN];
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([`# ${(r&&r.intent)||'harness output'}\n\n${LASTOUT}\n`],{type:'text/markdown'}));
+  a.download=`${RUN||'run'}-output.md`;
+  a.click(); URL.revokeObjectURL(a.href);
+}
+async function copyOutput(btn){
+  try{ await navigator.clipboard.writeText(LASTOUT); btn.textContent='✓ copied'; setTimeout(()=>btn.textContent='⧉ copy',1200); }
+  catch(e){ logLine({level:'error',msg:'clipboard blocked by the browser'}); }
+}
+async function rerun(){
+  const r=ALL[RUN]; if(!r||!r.intent)return;
+  $('modal').style.display='none';
+  const res=await api('POST','/runs',{intent:r.intent});
+  await refreshRuns(); selRun(res.run_id);
 }
 
 // ---------- node interactions ----------
@@ -452,6 +598,11 @@ async function clickNode(nid){
      <table style="border-collapse:collapse">${rows.map(([k,v])=>
        `<tr><td style="color:var(--dim);padding:1px 10px 1px 0;vertical-align:top">${k}</td><td style="color:var(--fg)">${esc(v)}</td></tr>`).join('')}</table>
      ${n.result!=null?`<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:6px;color:var(--fg);white-space:pre-wrap">${esc(renderResult(n.result))}</div>`:''}
+     ${r.phase==='planning'&&['PENDING','WAITING'].includes(n.state)
+        ?`<div style="margin-top:8px">${n.tool?`<div class="chip" style="margin-bottom:6px">held — runs after you approve the plan</div><br>`:''}
+          <button onclick="addBranch('${nid}')" title="add a sub-branch under this node — the LLM reasons it out from the neighbor context">＋ add a branch here</button>
+          <button onclick="editIntent('${rid}','${nid}')" title="rewrite this node's instruction">✎ edit intent</button>
+          <button onclick="replanNode('${rid}','${nid}')" title="delete this subtree and let the planner break it down again (against your constraints)">✏️ break down further</button></div>`:''}
      ${['ESCALATED','FAILED'].includes(n.state)?`<div style="margin-top:8px"><button onclick="retry('${rid}','${nid}')">fix &amp; retry</button></div>`:''}`;
 }
 async function retry(rid,nid){await api('POST',`/runs/${rid}/patch`,{ops:[{op:"retry_node",node_id:nid}],reason:"user fix"});}

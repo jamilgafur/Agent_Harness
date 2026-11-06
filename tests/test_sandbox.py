@@ -42,6 +42,53 @@ def test_html_to_text_strips_scripts_and_tags():
     assert "<" not in text
 
 
+# ---------- web_search reads the pages it links ----------
+class _Resp:
+    def __init__(self, status_code=200, text="", data=None):
+        self.status_code, self.text = status_code, text
+        self.headers = {"content-type": "text/html"}
+        self._data = data
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception("http error")
+
+
+def test_web_search_reads_every_hit_and_survives_dead_urls(monkeypatch):
+    pages = {"https://a.test/one": "<h1>Alpha</h1><p>full article text here</p>"}
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, params=None, headers=None, timeout=None,
+                follow_redirects=False):
+            if url.endswith("/search"):
+                if params and params.get("format") == "json":
+                    return _Resp(403)            # force the HTML scrape path
+                return _Resp(200, SEARX_HTML)
+            if url in pages:
+                return _Resp(200, pages[url])
+            raise sb.httpx.ConnectError("dead")
+
+    monkeypatch.setattr(sb.httpx, "Client", FakeClient)
+    from fastapi.testclient import TestClient
+    out = TestClient(sb.app).post(
+        "/web_search", json={"query": "x", "max_results": 5}).json()
+    hits = {h["url"]: h for h in out["results"]}
+    assert "full article text here" in hits["https://a.test/one"]["page_text"]
+    assert "page_text" not in hits["https://b.test/two"]   # dead url: hit kept
+
+
 # ---------- MCP stdio client (P2) ----------
 EXAMPLE_MCP = Path(sb.__file__).parent.parent / "examples" / "mcp_hello.py"
 

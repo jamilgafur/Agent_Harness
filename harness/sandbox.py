@@ -1,5 +1,7 @@
 """Sandbox: the ONLY place code runs. Shell + file ops confined to /workspace,
-plus outbound web access (search/fetch) so runs can gather references,
+plus outbound web access (search/fetch) so runs can gather references —
+`web_search` doesn't stop at snippets: it reads the top-3 pages (`_page_text`)
+so downstream writers get real article text —
 plus dynamic tools: drop a .py in /workspace/tools and it becomes a tool (P2).
 
 Convenience boundary, not a security one (see plan.txt §7).
@@ -11,6 +13,7 @@ import re
 import select
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from pathlib import Path
 
@@ -147,11 +150,13 @@ def web_search(req: SearchReq) -> dict:
                 r = c.get(f"{SEARX_URL}/search", params={"q": req.query})
                 r.raise_for_status()
                 results = _parse_searx_html(r.text, limit)
-            # read the top pages: snippets alone aren't research
-            for hit in results[:3]:
-                body = _page_text(c, hit["url"])
+            # read the pages, not just snippets: fetch every hit concurrently
+            def fetch(hit):
+                body = _page_text(c, hit["url"], cap=2500)
                 if body:
                     hit["page_text"] = body
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                list(pool.map(fetch, results))
             return {"results": results}
     except httpx.HTTPStatusError as e:
         return {"rc": -5, "stderr": f"search backend {e.response.status_code}"}
