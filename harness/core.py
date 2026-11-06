@@ -28,6 +28,13 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "read_file": {"desc": "read a file from the workspace", "required": ["path"]},
     "write_file": {"desc": "write a file in the workspace", "required": ["path", "content"]},
     "list_dir": {"desc": "list a directory in the workspace", "required": ["path"]},
+    "web_search": {"desc": "search the web (SearXNG); returns [{title,url,snippet}]",
+                   "required": ["query"]},
+    "http_fetch": {"desc": "fetch a URL and return readable text",
+                   "required": ["url"]},
+    "llm": {"desc": "virtual (agent-side): the LLM writes an answer using its deps' "
+                    "results as material; returns {text}. No args.",
+            "required": []},
 }
 EVENT_CAP = 500          # per run; research tool, not Splunk
 AGENT_STALE_S = 15       # heartbeat older than this -> agent shown dead
@@ -213,12 +220,17 @@ def _settle(run: Dict[str, Any], nid: str) -> None:
 
 
 async def _exec_tool(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Core mediates every tool call to the sandbox."""
-    path = {"shell": "/shell", "read_file": "/read_file",
-            "write_file": "/write_file", "list_dir": "/list_dir"}[tool]
+    """Core mediates every tool call to the sandbox. Static tools have fixed
+    endpoints; anything else is a dynamic tool from /workspace/tools (P2)."""
+    if tool == "llm":   # virtual, agent-side only — never sandboxed
+        return {"rc": -7, "stderr": "llm is agent-side; not executable via the sandbox"}
+    path = {"shell": "/shell", "read_file": "/read_file", "write_file": "/write_file",
+            "list_dir": "/list_dir", "web_search": "/web_search",
+            "http_fetch": "/http_fetch"}.get(tool, "/run_tool")
+    payload = args if path != "/run_tool" else {"name": tool, "args": args}
     try:
         async with httpx.AsyncClient(timeout=70) as c:
-            r = await c.post(CFG["sandbox_url"] + path, json=args)
+            r = await c.post(CFG["sandbox_url"] + path, json=payload)
             r.raise_for_status()
             return r.json()
     except httpx.HTTPStatusError as e:
@@ -226,6 +238,24 @@ async def _exec_tool(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 "stderr": f"sandbox {e.response.status_code}: {e.response.text[:300]}"}
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         return {"rc": -4, "stdout": "", "stderr": f"sandbox unreachable: {type(e).__name__}"}
+
+
+def _budget_breach(run: Dict[str, Any]) -> str:
+    """Budget governor: returns a reason when the run exceeded its budgets."""
+    if run["stats"]["llm_calls"] >= POLICY["max_llm_calls"]:
+        return f"max_llm_calls={POLICY['max_llm_calls']} reached"
+    if time.time() - run["created"] >= POLICY["max_seconds"]:
+        return f"max_seconds={POLICY['max_seconds']} reached"
+    return ""
+
+
+def _terminate(run: Dict[str, Any], reason: str) -> None:
+    """Governor stop: every live node ESCALATED -> run leaves the claimable set."""
+    for n in run["nodes"].values():
+        if n.state in (NodeState.PENDING, NodeState.RUNNING, NodeState.REPAIRING,
+                       NodeState.WAITING):
+            n.state, n.hint = NodeState.ESCALATED, f"budget governor: {reason}"
+            n.claimed_at = 0.0
 
 
 def _requeue_stale(run: Dict[str, Any]) -> None:
@@ -249,6 +279,7 @@ class RunIn(BaseModel):
 
 class ClaimIn(BaseModel):
     agent_id: str
+    max_nodes: int = 1     # parallel ready-set: claim up to this many leaves at once
 
 
 class ResultIn(BaseModel):
@@ -263,7 +294,7 @@ class ChildIn(BaseModel):
     intent: str
     tool: Optional[str] = None
     args: Dict[str, Any] = {}
-    deps: List[int] = []     # sibling indices; must point to EARLIER siblings
+    deps: List[Any] = []    # sibling indices (agent) or sibling ids (approval round-trip)
     success_predicate: str = ""
 
 
@@ -311,12 +342,22 @@ def _build_children(nodes: Dict[str, Node], nid: str,
     errors: List[str] = []
     children: List[Node] = []
     for i, ch in enumerate(parsed):
+        resolved: List[str] = []
         for j in ch.deps:
-            if not 0 <= j < i:
-                errors.append(f"child {i}: dep index {j} must point to an earlier sibling")
+            if isinstance(j, int):
+                if not 0 <= j < i:
+                    errors.append(f"child {i}: dep index {j} must point to an earlier sibling")
+                else:
+                    resolved.append(f"{nid}.{j + 1}")
+            elif isinstance(j, str) and any(c.id == j for c in children):
+                resolved.append(j)          # parked approval form: already-resolved id
+            else:
+                errors.append(f"child {i}: dep {j!r} must be an earlier sibling index or id")
+        # small models write "tool": "null" (string) — treat null-ish as abstract
+        tool = None if (ch.tool or "").strip().lower() in ("null", "none", "") else ch.tool
         children.append(Node(
-            id=f"{nid}.{i + 1}", intent=ch.intent, tool=ch.tool, args=ch.args,
-            deps=list(parent.deps) + [f"{nid}.{j + 1}" for j in ch.deps if 0 <= j < i],
+            id=f"{nid}.{i + 1}", intent=ch.intent, tool=tool, args=ch.args if tool else {},
+            deps=list(parent.deps) + resolved,
             success_predicate=ch.success_predicate, depth=parent.depth + 1, parent=nid))
     errors += tool_arg_errors({c.id: c for c in children})
     return ([] if errors else children), errors
@@ -359,14 +400,52 @@ def tools() -> Dict[str, Any]:
     return {"tools": TOOLS, "auto_approve": POLICY["auto_approve"]}
 
 
+@app.post("/tools/sync")
+async def tools_sync() -> Dict[str, Any]:
+    """Pull dynamic tools (P2) from the sandbox into the registry. Repeatable:
+    re-sync after dropping or editing a .py in /workspace/tools."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(CFG["sandbox_url"] + "/discover_tools")
+            r.raise_for_status()
+            found = r.json().get("tools", {})
+    except Exception as e:
+        raise HTTPException(502, f"sandbox: {type(e).__name__}")
+    for name in [k for k, v in TOOLS.items() if v.get("dynamic") and k not in found]:
+        del TOOLS[name]                # hot-reload removes vanished tools too
+    for name, meta in found.items():
+        TOOLS[name] = {"desc": meta.get("desc", f"dynamic tool ({meta.get('file')})"),
+                       "required": meta.get("required", []), "dynamic": True}
+    return {"synced": sorted(found), "tools": TOOLS}
+
+
 @app.get("/policy")
 def get_policy() -> Dict[str, Any]:
     return POLICY
 
 
+@app.get("/autosize")
+async def autosize() -> Dict[str, Any]:
+    """Autosizer (P3): suggest max_agents from measured LLM latency.
+    shortcut: fixed latency bands; a real autosizer also watches queue depth
+    and VRAM — upgrade if the mesh ever shares the GPU with other services."""
+    t0 = time.time()
+    ok = False
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            ok = (await c.get(CFG["ollama_url"] + "/api/tags")).status_code == 200
+    except Exception:
+        pass
+    ms = round((time.time() - t0) * 1000)
+    suggested = 1 if not ok else (8 if ms < 200 else 4 if ms < 600 else 2 if ms < 1500 else 1)
+    return {"ollama_ok": ok, "ping_ms": ms if ok else None,
+            "suggested_max_agents": suggested, "current": POLICY["max_agents"]}
+
+
 @app.post("/policy")
 async def set_policy(body: Dict[str, Any]) -> Dict[str, Any]:
-    allowed = {"max_agents", "approve_dag_edits", "claim_lease_seconds", "confirm_actions"}
+    allowed = {"max_agents", "approve_dag_edits", "claim_lease_seconds",
+               "confirm_actions", "auto_approve"}
     unknown = set(body) - allowed
     if unknown:
         raise HTTPException(400, f"not editable at runtime: {sorted(unknown)}")
@@ -443,12 +522,14 @@ def get_events(run_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
 
 
 @app.delete("/runs/{run_id}")
-async def delete_run(run_id: str) -> Dict[str, Any]:
+async def delete_run(run_id: str, force: bool = False) -> Dict[str, Any]:
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "unknown run")
     if _active(run):
-        raise HTTPException(409, "run is still active; let it finish or escalate first")
+        if not force:
+            raise HTTPException(409, "run is still active; pass force=1 to stop and delete")
+        _terminate(run, "deleted by user")   # stop the claim/heartbeat dance before removal
     async with _lock:
         del RUNS[run_id]
         store.delete_run(run_id)
@@ -459,44 +540,78 @@ async def delete_run(run_id: str) -> Dict[str, Any]:
 # ---------- endpoints: agent loop ----------
 @app.post("/claim")
 async def claim(body: ClaimIn) -> Dict[str, Any]:
+    terminated: List[str] = []
     async with _lock:
         candidates = []  # (run, node) ready across active runs
         for run in sorted(RUNS.values(), key=lambda x: x["created"]):
             if not _active(run):
                 continue
             _requeue_stale(run)
+            breach = _budget_breach(run)
+            if breach:
+                _terminate(run, breach)
+                store.save_run(run)
+                store.log(run["id"], "error", "budget", "core", "-",
+                          f"run terminated: {breach}")
+                terminated.append(run["id"])
+                continue
             candidates += [(run, n) for n in ready_nodes(run["nodes"])]
+        if candidates:
+            # Algorithm 2 routing: exclude nodes where this agent is in the
+            # visited set (it redirected them away); if nothing remains, ⊥
+            fresh = [c for c in candidates if body.agent_id not in c[1].routed_past]
+            if fresh:
+                candidates = fresh
+            else:
+                candidates = []
         if not candidates:
-            return {"node": None}
-        # locality: prefer siblings of the node this agent last worked on (answer 7:
-        # agents grow their branch then move up); else deepest ready node
-        picked = None
-        last = AGENTS.get(body.agent_id, {})
-        last_run = RUNS.get(last.get("run_id", ""))
-        if last_run and last.get("node_id") in last_run["nodes"]:
-            last_parent = last_run["nodes"][last["node_id"]].parent
-            own = [c for c in candidates if c[0]["id"] == last_run["id"]
-                   and c[1].parent and c[1].parent == last_parent]
-            picked = max(own, key=lambda c: c[1].depth) if own else None
-        if picked is None:
-            picked = max(candidates, key=lambda c: c[1].depth)
-        run, n = picked
-        n.state = NodeState.RUNNING
-        n.attempts += 1
-        n.claimed_at = time.time()
-        AGENTS[body.agent_id] = {"last_seen": time.time(), "run_id": run["id"],
-                                 "node_id": n.id, "phase": "claimed"}
-        store.save_run(run)
-        store.log(run["id"], "info", "task", "core", body.agent_id,
-                  f"Task: {body.agent_id} claimed {n.id}",
-                  {"node": n.id, "type": "Task"})
-        inputs = {d: run["nodes"][d].result for d in n.deps}
-        siblings = [{"id": s.id, "state": s.state.value} for s in run["nodes"].values()
-                    if s.parent == n.parent and s.id != n.id]
+            picked: List[Tuple[Dict[str, Any], Node]] = []
+        else:
+            # locality: prefer siblings of the node this agent last worked on (answer 7:
+            # agents grow their branch then move up); else deepest ready node
+            first = None
+            last = AGENTS.get(body.agent_id, {})
+            last_run = RUNS.get(last.get("run_id", ""))
+            if last_run and last.get("node_id") in last_run["nodes"]:
+                last_parent = last_run["nodes"][last["node_id"]].parent
+                own = [c for c in candidates if c[0]["id"] == last_run["id"]
+                       and c[1].parent and c[1].parent == last_parent]
+                first = max(own, key=lambda c: c[1].depth) if own else None
+            if first is None:
+                first = max(candidates, key=lambda c: c[1].depth)
+            # parallel ready-set: fill remaining slots from the same run, deepest first
+            want = max(1, min(body.max_nodes, 8))
+            pool = [c for c in candidates if c[0]["id"] == first[0]["id"] and c != first]
+            pool.sort(key=lambda c: -c[1].depth)
+            picked = [first] + pool[: want - 1]
+        if picked:
+            run, first = picked[0][0], picked[0][1]
+            nodes: List[Node] = []
+            for _, n in picked:
+                n.state = NodeState.RUNNING
+                n.attempts += 1
+                n.claimed_at = time.time()
+                nodes.append(n)
+                store.log(run["id"], "info", "task", "core", body.agent_id,
+                          f"Task: {body.agent_id} claimed {n.id}",
+                          {"node": n.id, "type": "Task"})
+            AGENTS[body.agent_id] = {"last_seen": time.time(), "run_id": run["id"],
+                                     "node_id": first.id, "phase": "claimed"}
+            store.save_run(run)
+            inputs = {d: run["nodes"][d].result for d in first.deps}
+            siblings = [{"id": s.id, "state": s.state.value}
+                        for s in run["nodes"].values()
+                        if s.parent == first.parent and s.id != first.id]
+    for rid in terminated:
+        await _state(rid)
+    if not picked:
+        return {"node": None}
     await _state(run["id"])
     await _broadcast({"type": "agents", "agents": _agents_public()})
-    return {"run_id": run["id"], "node": n.model_dump(mode="json"), "inputs": inputs,
-            "siblings": siblings, "tools": TOOLS, "max_depth": POLICY["max_depth"]}
+    return {"run_id": run["id"], "node": first.model_dump(mode="json"),
+            "nodes": [n.model_dump(mode="json") for n in nodes],
+            "inputs": inputs, "siblings": siblings, "tools": TOOLS,
+            "max_depth": POLICY["max_depth"]}
 
 
 @app.post("/runs/{run_id}/nodes/{nid}/redirect")
@@ -512,6 +627,8 @@ async def redirect(run_id: str, nid: str, body: RedirectIn) -> Dict[str, Any]:
         n.state = NodeState.PENDING
         n.claimed_at = 0.0
         n.hint = f"redirected by {body.agent_id}: {body.reason}"[:300]
+        if body.agent_id not in n.routed_past:
+            n.routed_past.append(body.agent_id)   # Alg-2: mark agent as visited
         store.save_run(run)
     await _event(run_id, "warn", "redirect", body.agent_id, "core",
                  f"Redirect: {nid} — {body.reason or 'no reason'}",
@@ -534,12 +651,31 @@ async def report(run_id: str, nid: str, body: ResultIn) -> Dict[str, Any]:
         if body.state == "DONE":
             n.state, n.result, n.hint = NodeState.DONE, body.result, ""
             _settle(run, nid)
+        elif n.type == NodeType.LOOP:
+            if n.attempts < n.max_iterations:
+                # shortcut: loop = requeue-per-iteration, not DAG unrolling; upgrade
+                # when a loop body needs to be a multi-node subgraph (P-later)
+                n.state, n.result = NodeState.PENDING, body.result
+                n.hint = (body.hint[:200] if body.hint else
+                          f"condition unmet — iteration {n.attempts}/{n.max_iterations}")
+                store.log(run["id"], "info", "loop", body.agent_id or "-", "core",
+                          f"{nid}: iteration {n.attempts}/{n.max_iterations}, condition unmet")
+            else:
+                _fail_cascade(run, nid,
+                              body.hint or f"loop: condition unmet after "
+                                           f"{n.attempts} iterations",
+                              NodeState.ESCALATED)
         else:
             if n.attempts < POLICY["max_repairs"]:
                 n.state, n.hint = NodeState.REPAIRING, body.hint
             else:
                 _fail_cascade(run, nid, body.hint or f"failed after {n.attempts} attempts",
                               NodeState.ESCALATED)
+        breach = _budget_breach(run)
+        if breach:
+            _terminate(run, breach)
+            store.log(run["id"], "error", "budget", "core", "-",
+                      f"run terminated: {breach}")
         store.save_run(run)
     await _event(run_id, "info" if body.state == "DONE" else "warn",
                  "result", body.agent_id or "-", "core",
@@ -552,10 +688,26 @@ async def decompose(run_id: str, nid: str, body: DecomposeIn) -> Dict[str, Any]:
     run = RUNS.get(run_id)
     if not run or nid not in run["nodes"]:
         raise HTTPException(404, "unknown run or node")
+    breach = _budget_breach(run)
+    if breach:
+        async with _lock:
+            _terminate(run, breach)
+            store.save_run(run)
+        await _event(run_id, "error", "budget", "core", "-", f"run terminated: {breach}")
+        await _state(run_id)
+        raise HTTPException(429, f"budget governor: {breach}")
     children, errs = _build_children(run["nodes"], nid,
                                      [c.model_dump() for c in body.children])
     if errs:
         raise HTTPException(400, errs)
+    # validate as a graph patch even when approvals are on: a bad decomposition
+    # must bounce into the agent's repair loop now, not into the user's dialog later
+    check = Patch(ops=[{"op": "add_node", "node": c.model_dump()} for c in children],
+                  reason=f"decompose {nid}")
+    _, verrs = apply_patch(run["nodes"], check, TOOLS, POLICY["max_depth"],
+                           POLICY["max_nodes"], POLICY["auto_approve"])
+    if verrs:
+        raise HTTPException(400, verrs)
     if POLICY["approve_dag_edits"]:
         a = {"id": uuid.uuid4().hex[:8], "run_id": run_id, "node_id": nid, "kind": "patch",
              "tool": "", "args": {"children": [c.model_dump(mode="json") for c in children]},
@@ -700,6 +852,85 @@ async def decide(aid: str, body: DecisionIn) -> Dict[str, Any]:
                  f"exec {a['tool']} {'approved' if approved else 'REJECTED'} on {a['node_id']}")
     await _broadcast({"type": "approval", "approval": a})
     return {"exec_id": aid, "status": a["status"], "result": a["result"]}
+
+
+# ---------- metrics (P5: paper §V definitions) ----------
+@app.get("/metrics")
+def metrics() -> Dict[str, Any]:
+    """latency (run start→last event), TSR (intents with all nodes DONE),
+    FRT (failed node → its DONE report), delegation depth (max node depth),
+    KG-consistency proxy (first-pass success: DONE nodes at attempts==1)."""
+    per_run: Dict[str, Any] = {}
+    frt_samples: List[int] = []
+    done_total = done_first_pass = 0
+    for run in RUNS.values():
+        evs = store.events(run["id"])
+        latency_ms = round(((evs[-1]["ts"] if evs else time.time()) - run["created"]) * 1000)
+        nodes = list(run["nodes"].values())
+        all_done = bool(nodes) and all(n.state == NodeState.DONE for n in nodes)
+        # FRT: pair each FAILED result with the next DONE result on the same node
+        fails: Dict[str, List[float]] = {}
+        frts: List[int] = []
+        for e in evs:
+            p = e.get("payload") or {}
+            if e["kind"] == "result" and p.get("node"):
+                nid = p["node"]
+                if p.get("state") == "FAILED":
+                    fails.setdefault(nid, []).append(e["ts"])
+                elif p.get("state") == "DONE" and fails.get(nid):
+                    frts.append(round((e["ts"] - fails[nid][-1]) * 1000))
+        frt_ms = round(sum(frts) / len(frts)) if frts else None
+        frt_samples += frts
+        d = max((n.depth for n in nodes), default=0)
+        done = [n for n in nodes if n.state == NodeState.DONE]
+        fp = sum(1 for n in done if n.attempts <= 1)
+        done_total += len(done)
+        done_first_pass += fp
+        per_run[run["id"]] = {"latency_ms": latency_ms, "all_done": all_done,
+                              "active": _active(run), "frt_ms": frt_ms,
+                              "max_depth": d, "nodes": len(nodes),
+                              "llm_calls": run["stats"]["llm_calls"]}
+    finished = [v for v in per_run.values() if not v["active"]]
+    tsr = (round(100 * sum(1 for v in finished if v["all_done"]) / len(finished))
+           if finished else None)
+    return {
+        "runs": per_run,
+        "total": {
+            "tsr_pct": tsr,
+            "avg_latency_ms": (round(sum(v["latency_ms"] for v in finished) / len(finished))
+                               if finished else None),
+            "avg_frt_ms": (round(sum(frt_samples) / len(frt_samples))
+                           if frt_samples else None),
+            "max_delegation_depth": max((v["max_depth"] for v in per_run.values()), default=0),
+            "first_pass_pct": (round(100 * done_first_pass / done_total)
+                               if done_total else None),
+        },
+    }
+
+
+# ---------- workspace proxy (read-only, for the UI files panel) ----------
+@app.get("/workspace/files")
+async def ws_files(path: str = ".") -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(CFG["sandbox_url"] + "/list_dir", json={"path": path})
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        raise HTTPException(502, f"sandbox: {type(e).__name__}")
+
+
+@app.get("/workspace/file")
+async def ws_file(path: str) -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(CFG["sandbox_url"] + "/read_file", json={"path": path})
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(e.response.status_code, e.response.text[:200])
+    except Exception as e:
+        raise HTTPException(502, f"sandbox: {type(e).__name__}")
 
 
 # ---------- websocket + UI ----------

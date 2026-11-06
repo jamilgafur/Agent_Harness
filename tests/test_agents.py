@@ -159,6 +159,31 @@ def test_heartbeat_registry_and_events_persist(client):
     assert "run" in kinds and "task" in kinds
 
 
+def test_alg2_visited_agent_avoidance(client):
+    r = client.post("/runs", json={"nodes": [
+        {"id": "x", "intent": "task x", "tool": "write_file",
+         "args": {"path": "x", "content": "1"}, "success_predicate": "p"},
+        {"id": "y", "intent": "task y", "tool": "write_file",
+         "args": {"path": "y", "content": "1"}, "success_predicate": "p"}]})
+    run_id = r.json()["run_id"]
+    first = client.post("/claim", json={"agent_id": "a1"}).json()["node"]["id"]
+    client.post(f"/runs/{run_id}/nodes/{first}/redirect",
+                json={"agent_id": "a1", "reason": "not my skill"})
+    # a1 redirected it: next claim must avoid it (Algorithm 2: Candidates \ Visited)
+    c2 = client.post("/claim", json={"agent_id": "a1"}).json()
+    assert c2["node"]["id"] != first
+    # a1 redirects the other too -> visited everywhere -> bottom (no node)
+    client.post(f"/runs/{run_id}/nodes/{c2['node']['id']}/redirect",
+                json={"agent_id": "a1", "reason": "nope"})
+    assert client.post("/claim", json={"agent_id": "a1"}).json()["node"] is None
+    # another agent is unvisited -> claims fine
+    assert client.post("/claim", json={"agent_id": "a2"}).json()["node"] is not None
+    # user retry clears the visited set -> a1 is eligible again
+    client.post(f"/runs/{run_id}/patch",
+                json={"ops": [{"op": "retry_node", "node_id": first}], "reason": "fix"})
+    assert client.post("/claim", json={"agent_id": "a1"}).json()["node"]["id"] == first
+
+
 def test_delete_run_and_policy_edit(client):
     run_id = abstract_run(client)
     assert client.delete(f"/runs/{run_id}").status_code == 409  # still active

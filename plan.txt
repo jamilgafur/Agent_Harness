@@ -17,17 +17,26 @@
 | 18 | Real mesh, auto max-agents | Agent replicas claim atomically from core; autosizer = P3; `policy.max_agents` / compose scale for now |
 | 20 | Acceptance: "add tests to repo X, make them pass" | Template-DAG + auto_approve path must run unaided |
 
-## 2. Current state (verified 2026-11-04)
+## 2. Current state (verified 2026-11-05)
 
-DONE (committed, pure logic):
-- `harness/models.py` — Node/NodeState/Patch/message schema (paper III-B, IV-A), policy defaults
-- `harness/graph.py` — DAG validate (cycles, depth≤17, budgets, tool names), patch apply-on-copy, ready set, lint
-- `harness/llm.py` — Ollama client, JSON mode + repair round-trip, `ping()` for autosizer
-- `harness/config.py` — harness.toml + env override loader
+**All phases §6 complete; 38/38 tests pass; stack live at http://ubuntu:8100.**
+Everything runnable: core/agent/sandbox services, UI, checkpointing, and the full
+tool layer (static + web + dynamic-python + MCP). Verified end-to-end both ways:
+attended (every exec/patch gated by approval) and unaided (acceptance demo: 5/5
+DONE, 0 LLM calls, 0 approvals — see §6/P5).
 
-MISSING: everything runnable. No Dockerfile, no compose, no services (core/agent/sandbox), no UI, no tests, no requirements.txt, no harness.toml.
+- `harness/models.py` — Node (+type loop, +routed_past, +claimed_at), NodeState, Patch, policy defaults
+- `harness/graph.py` — validate (cycles, depth≤17, loop rules, budgets), patch apply-on-copy, ready set, retry clears visited set
+- `harness/core.py` — runs/claim(≤8 parallel)/decompose/exec(+run_tool routing)/approvals/patch,
+  /tools/sync, /autosize, /metrics, /workspace proxy, WS, budget governor, Alg-2 visited routing
+- `harness/agent.py` — claim→exec→judge→report loop, decompose w/ repair loop, condition judge for loops
+- `harness/sandbox.py` — shell/files, web_search (SearXNG json→HTML fallback), http_fetch,
+  dynamic tool discovery, MCP stdio client (manifest mtime hot-reload)
+- `harness/static/index.html` — DAG canvas, agent layer, approvals dialog, files panel, metrics chip
+- `examples/` — write-paper.json, add-tests.json, doc_writer.py, mcp_hello.py, acceptance-demo.sh (+recorded .txt)
+- `tests/` — 38 tests across graph, core API, agent/mesh, sandbox web tools, MCP round-trip
 
-BROKEN: local `.venv` (built for py3.9, python symlink → system 3.14, deps unreachable). Irrelevant once dockerized; delete later.
+Still around: broken local `.venv/` (unused; delete when convenient), `main.pdf` (paper, reference).
 
 ## 3. Architecture (all docker, all local)
 
@@ -68,17 +77,29 @@ The 1070 box stays the option for 7b+. No Redis/NATS — HTTP + WS only.
 
 Core REST (all JSON):
 - `POST /runs` — `{intent}` (seed root) or `{nodes:[...]}` (validated template import) → `{run_id, errors?}`
-- `GET /runs` → summaries · `GET /runs/{id}` → full state (nodes, stats, policy)
-- `POST /claim {agent_id}` → next ready node across active runs (asyncio.Lock = atomic) or null
-- `POST /runs/{id}/nodes/{nid}/result {state, result?, hint?}` — core settles: parents, cascades, escalate
-- `POST /runs/{id}/nodes/{nid}/decompose {children:[{intent,tool?,args,deps:[sibling idx],success_predicate}]}` → built into Patch(ops decompose+add_node), validated via `graph.apply_patch`, errors returned for LLM repair loop
-- `POST /runs/{id}/exec {node_id, tool, args}` → `{exec_id, status}`; auto-executes if tool ∈ auto_approve else creates approval
+- `GET /runs` → summaries · `GET /runs/{id}` → full state (nodes, stats, policy) · `DELETE /runs/{id}` (inactive only)
+- `GET /runs/{id}/events?after_id=` → persisted event/mailbox log (cap 500/run)
+- `POST /claim {agent_id, max_nodes=1}` → up to 8 ready nodes, atomic; locality preference, Alg-2 visited exclusion
+- `POST /runs/{id}/nodes/{nid}/result {state, result?, hint?, llm_calls?}` — settle: parents, cascades, loop requeue, governor
+- `POST /runs/{id}/nodes/{nid}/decompose {children:[...]}` → validated patch or pending patch-approval
+- `POST /runs/{id}/nodes/{nid}/redirect {agent_id, reason}` — handoff; records visited set
+- `POST /runs/{id}/exec {node_id, tool, args}` → auto-executes if tool ∈ auto_approve else creates approval
 - `GET /exec/{exec_id}` → status + result (agent polls)
-- `GET /approvals?status=pending` · `POST /approvals/{id} {decision: approve|reject, args?}` (edited args = edit-and-resubmit)
-- `GET /tools` → registry `{shell, read_file, write_file, list_dir}` (dynamic registration = P2)
-- `POST /runs/{id}/patch` — graph ops (incl. `retry_node`) for user fixes from UI
-- `GET /health` → core ok + ollama reachable
-- `WS /ws` → pushes `state`, `approval`, `log` events on every mutation
+- `GET /approvals?status=pending` · `POST /approvals/{id} {decision, args?}` (edit-and-resubmit)
+- `GET /tools` → static + dynamic + MCP registry · `POST /tools/sync` → add/prune from sandbox discovery
+- `POST /runs/{id}/patch` — graph ops (`add_node`, `add_edge`, `replace_tool`, `retry_node`) for user fixes
+- `GET /policy` · `POST /policy` — runtime: max_agents, approve_dag_edits, claim_lease_seconds, confirm_actions, auto_approve
+- `GET /autosize` → ollama ping → suggested max_agents (latency bands)
+- `GET /metrics` → per-run + totals: latency, TSR, FRT, delegation depth, first-pass (KG-consistency proxy)
+- `GET /workspace/files|file` → read-only proxy to sandbox (UI files panel)
+- `GET /health` → core ok + ollama reachable · `WS /ws` → state/approval/log/agents/policy events
+
+Loop semantics: node `{type: loop, tool, condition, max_iterations}` — agent executes the tool body,
+judges `condition`; unmet → requeue PENDING (hint + result kept), met → DONE, `max_iterations` spent →
+ESCALATED + descendants BLOCKED (the infinite-loop fallback).
+
+Budget governor: `max_llm_calls`/`max_seconds` checked on claim sweep, on every result report, and before
+decompose → breach terminates the run (live nodes → ESCALATED w/ `budget governor: …`, finished work kept).
 
 Execution semantics:
 - Tool node: executor fills nothing; node carries tool+args from decomposition. No `success_predicate` → shell success = rc==0 (no LLM call → offline-testable). With predicate → LLM judge `{ok, why}`.
@@ -86,9 +107,9 @@ Execution semantics:
 - Failure: REPAIRING while attempts ≤ policy.max_repairs (hint fed to next claim); then ESCALATED (hint to user) + descendants BLOCKED (`graph.descendants`). User fixes via UI → `retry_node` op → recompute un-BLOCKED.
 - Augmented validation: `apply_patch` requires terminal nodes (except tool nodes with auto_approve... simpler: auto_approve tools exempt) to carry a `success_predicate` — forces LLM to think in outcomes, judge never defaults to "ask LLM".
 
-Sandbox endpoints: `POST /shell {cmd, timeout}`, `/read_file`, `/write_file`, `/list_dir` — paths confined to /workspace, output truncated 20KB, timeout ≤60s.
+Sandbox endpoints: `POST /shell {cmd, timeout}`, `/read_file`, `/write_file`, `/list_dir` — paths confined to /workspace, output truncated 20KB, timeout ≤60s. `/web_search` reads the top 3 pages itself (`page_text` per hit via `_page_text`) — snippets alone weren't research; `_material` prefers page_text over snippets. `_force_synthesis` also grounds lone llm children (single bare writer → search+sink). UI is human-facing: state-pill detail card + readable approval cards w/ collapsible JSON, prose output modal, clickable attention chip; tab delete moved out of nested button (click bug); hard-refresh required after rebuilds.
 
-Agent loop: claim → tool ? exec+w poll+judge : decompose (LLM, ≤max_repairs resubmits) → report. Heartbeat = claim poll. Budget stats counted in core per run (llm_calls reported by agent).
+Agent loop: claim → tool ? exec+w poll+judge : decompose (LLM, ≤max_repairs resubmits) → report. Heartbeat = claim poll. Budget stats counted in core per run (llm_calls reported by agent). Virtual `llm` tool = agent-side synthesis: walks the DAG upward (deps+parents, DONE-with-result only, heartbeat phase "reading upstream") for material, model writes `result.text`. Decompose output is shape-pinned deterministically: `_force_synthesis` (research plans converge on ONE llm sink; degenerate all-gather prefix chains flattened to parallel; all-llm plans grounded into searches+sink; single llm over abstract branches becomes the sink) + `_deepen_branches` (root-level research plans become real trees: flat gather branches turn abstract and re-decompose into their own searches+summary — root.N.M ids). Acceptance is deterministic `_llm_ok` (predicates advisory — LLM-judging prose escalated runs falsely). Planner + synthesis both receive full upstream context (600-char clip/dep). Worker identity = `agent-<hostname-suffix>` → `docker compose up -d --scale agent=N` executes N ready leaves truly in parallel (atomic claims; max_agents default 4). Defaults ship Claude-Code-style (`harness.toml`): `approve_dag_edits=false` + `auto_approve=[web_search,http_fetch,read_file,list_dir,llm]`. Deletion: `DELETE /runs/{id}` (409 while active) / `?force=1` (terminate then remove); tabs ✕ on every run. **Verified live E2E, zero clicks, 3 agents**: "write a research paper on LLM quantization" → 15-node 3-level tree (3 abstract branches × searches+summary each + root sink, 1629-char grounded paper, root.4 deps==all branches); 3 agents visibly on root.1.2/root.2.2/root.2.3 simultaneously. 57 tests.
 
 ## 5. Checkpointing
 
@@ -98,13 +119,13 @@ SQLite `/data/harness.db`, one row per run, full JSON snapshot on every mutation
 
 - **P0 — docker skeleton**: Dockerfile, requirements.txt, compose.yaml, harness.toml, .dockerignore, health-checks, opt-in `local-ollama` profile (GPU reservation + model puller). ✅ this change
 - **P1 — single agent end-to-end**: core (store, claim, exec, approvals, settle, WS, UI), agent loop, sandbox shell, template import, confirm-everything + auto_approve, checkpoint/resume, pytest (10). ✅ this change. **Verified live**: template run unaided to DONE; attended path with LLM-down → repairs → ESCALATED/BLOCKED; intent run with local qwen2.5:3b → LLM decompose → exec → settle DONE (found+fixed: small models invent tool-arg names → args-schema validation closes the repair loop).
-- **P2 — tooling**: dynamic tool registration (drop .py in sandbox, schema via API), MCP stdio client + hot-reload, web search/fetch (SearXNG already on :8095 host), doc writer
-- **P3 — mesh (partially done)**: agent registry (heartbeat/position/phase), claim leases (stale RUNNING requeues, skips approval-pending nodes), claim locality (agents grow their branch), III-B messaging as mailbox events (Task/Result/Redirect/Heartbeat), Redirect handoffs, patch approvals with edit-and-resubmit, events persisted (cap 500/run). TODO: claim lease edge cases, routing per Algorithm 2, autosizer (max_agents editable via POST /policy; `LLM.ping()` suggestion TODO)
+- **P2 — tooling (done)**: web_search/http_fetch (S5). Dynamic tools: `*.py` with `TOOL={name,desc,required}` + `run(**args)` in `/workspace/tools/`; `POST /tools/sync` idempotently syncs registry (adds AND prunes vanished tools, so hot-reload is honest). MCP stdio client: manifest `/workspace/tools/mcp.json` `{servers: {name: {command:[...]}}}`, mtime-watched (hot-reload respawns only changed servers, kills removed ones, broken manifests keep the good set); tools surface as `mcp_<srv>_<tool>` through the same discovery pipe; examples/mcp_hello.py = dependency-free demo server; examples/doc_writer.py = the doc writer. **Verified live**: mcp manifest → sync → claim → approval → tools/call → "hello harness team"; manifest cleared → resync → tool pruned from core registry. 35 tests.
+- **P3 — mesh (done)**: agent registry (heartbeat/position/phase), claim leases (stale RUNNING requeues, skips approval-pending nodes — edge cases under test: double-handout, stale-report 409, redirect recovery), claim locality, III-B mailbox events, Redirect handoffs, patch approvals with edit-and-resubmit, events persisted (cap 500/run). Algorithm 2 routing: `routed_past` visited-set on nodes — a redirecting agent is excluded from re-claiming that node; strict ⊥ (no claim) when everything ready was visited by this agent; `retry_node` clears the set (user unstick). Autosizer: `GET /autosize` (ollama ping → latency bands → suggested max_agents; shortcut: bands ignore queue depth/VRAM). **Verified live** + tests.
 - **S2+S6+UI (done, this change)**: 19 tests. Hardening: claim lease, stale-report 409, decompose state guard, forward-dep errors, sandbox unreachable → rc:-4, DELETE /runs. Agents: registry/heartbeat/phase, locality, Redirect, patch approvals. UI: SVG layered canvas (pan/zoom/fit, bezier edges), agent chips gliding node→node, flashing patch-approval nodes → click → edit-and-approve dialog, persistent per-run event log, run deletion, attention counter. **Verified live**: intent run → LLM decompose → patch approval (agent phase waiting-approval) → approve → exec → DONE; `mesh-works` in workspace.
 - **S4 deploy (done)**: moved to ~/Docker_Enviorment/harness; restart: unless-stopped on core/sandbox/agent/ollama; watchtower opt-out labels (auto-updates would break local builds & restart ollama mid-inference); PORT default 8100 (8000 = lazytainer); .env carries PORT+COMPOSE_PROFILES so start_all.sh picks the whole stack up flag-free; homepage entry under "AI & LLM Services"; commit before move for safety. TODO if ever exposed beyond LAN: localhost bind / reverse proxy + auth.
-- **S5 paper tools**: web_search (SearXNG :8095 host), http_fetch, workspace files panel, examples/write-paper template
-- **P4 — loops & budgets**: LoopSpec unrolling, parallel ready-set, budget governor (max_llm_calls/max_seconds enforcement)
-- **P5 — metrics/paper**: latency, TSR, FRT, delegation depth, KG-consistency proxy; recorded acceptance demo
+- **S5 paper tools (done)**: web_search + http_fetch in sandbox (SearXNG on host :8095; JSON API is off by default there → HTML-scrape fallback, verified live on real results), workspace files panel in UI (read-only core proxy → sandbox), examples/write-paper.json template (refs→related/conclusion dep shape). Verified live: template import → claim refs_a → approval-gated exec → 6 real results → DONE. 24 tests.
+- **P4 — loops & budgets (done)**: LoopSpec = bounded requeue-per-iteration (loop node carries tool body + `condition`; agent judges condition each pass; `max_iterations` hard cap → ESCALATED + descendants BLOCKED — the infinite-loop fallback; shortcut: not DAG unrolling, upgrade when loop bodies need multi-node subgraphs). Parallel ready-set: `POST /claim {max_nodes}` hands out up to 8 ready leaves atomically (back-compat `node` field = first). Budget governor: `max_llm_calls`/`max_seconds` checked in claim sweep + report + decompose → breach terminates run (live nodes ESCALATED with `budget governor: …` hint, settled work kept, claims stop). 31 tests. **Verified live**: claim(max_nodes=2) → a+b RUNNING; loop L max_iterations=2 → 2 passes → ESCALATED, never re-offered; report with llm_calls=500 → w DONE, x ESCALATED, run inactive.
+- **P5 — metrics/paper (done)**: `GET /metrics` per paper §V — latency (created→last event), TSR (% finished runs with all nodes DONE), FRT (FAILED result → same node's DONE result, from event log), delegation depth (max node depth), KG-consistency proxy = first-pass success (DONE nodes at attempts==1); UI header chip shows TSR/latency/depth/first-pass. Recorded acceptance demo: `examples/acceptance-demo.sh` (replay: `./examples/acceptance-demo.sh | tee examples/acceptance-demo.txt`) — "add tests to repo X, make them pass" template runs **fully unaided: 5/5 DONE, 0 LLM calls, 0 approvals, ~2s** (auto_approve + rc==0 default judge path). Paper's EWC/throughput metrics not implemented (need multi-agent runs + learned edge weights; paper-future). 38 tests.
 
 ## 7. Decisions & risks
 
@@ -113,7 +134,48 @@ SQLite `/data/harness.db`, one row per run, full JSON snapshot on every mutation
 - Terminal-node predicate requirement is skipped for auto_approve tools (keeps unattended runs unaided).
 - Sandbox is a convenience boundary, not security isolation (docker-exec level). Fine for research, NOT for untrusted tools.
 - Small-model JSON reliability is the #1 failure mode → all LLM output goes through `chat_json` repair + `apply_patch` validation.
-- LLM-call accounting undercounts by 1 per abstract decomposition (the approval-gated decompose path returns before any report carries the delta). Not user-visible; fix in P5 metrics pass by billing claims.
+- LLM-call accounting undercounts by 1 per abstract decomposition (the approval-gated decompose path returns before any report carries the delta). Not user-visible; still open post-P5 — fix by billing claims instead of reports.
 - Claim lease (120s) can hand a node out twice if an agent is alive-but-slow (long LLM call mid-node); the stale-report 409 makes the loser harmless. UI: port is host-exposed unless you set PORT; auth is out of scope behind localhost.
 - requirements.txt unpinned (research velocity); pin before publishing.
 - `.venv/` is broken and now unused — remove when convenient.
+
+## 8. Next steps & open thoughts (post-P5, 2026-11-05)
+
+Ordered by value-per-effort. None block daily use; pick by what the paper/demo needs next.
+
+**Cheap hygiene**
+1. Delete the broken `.venv/`; pin `requirements.txt` before anything public.
+2. Enable SearXNG `formats: [json]` in its settings.yml → drop the HTML-scrape fallback
+   (fragile against theme changes; the JSON path is already coded and takes priority).
+
+**Demo/paper assets**
+3. Run the write-paper demo on the 1070 box with a 7b model: intent
+   "write a paper about X" → watch adaptive dep growth (related-works pulls citations up,
+   conclusion waits on results) — the §6/S5 template proves the plumbing; an attended
+   LLM run is the cinematic demo. Freeze it via `HARNESS_CONFIG='{"policy":{"approve_dag_edits":true}}'`.
+4. Multi-agent runs (`--scale agent=2`) with a killed agent mid-run → exercises FRT for real
+   and gives the paper its recovery numbers; metrics endpoint already reports per-run FRT.
+5. Paper metrics not yet implemented: EWC (needs learned edge weights) and throughput
+   (needs sustained multi-run load). Both are paper-future, not harness features.
+
+**Feature upgrades (all have shortcut comments in code)**
+6. Loop upgrade: requeue-per-iteration → DAG-unrolling when a loop body must be a
+   multi-node subgraph (comment in core.report).
+7. Autosizer upgrade: latency bands → queue-depth + VRAM-aware sizing
+   (comment in core.autosize; LLM.ping() is wired but unused).
+8. Repair creativity: REPAIRING re-executes the SAME args — fine for flaky tools, useless
+   for "make failing tests pass" logic. Candidate fix: on last repair attempt, auto-convert
+   the tool node into an abstract node so the next claim decomposes instead of re-executing.
+   Small change in core.report, big behavior win; think through judge semantics first.
+9. MCP: point the manifest at real servers (filesystem/github) once the sandbox image needs
+   them; client is protocol-complete for tools/list + tools/call.
+
+**Only-if-exposed-beyond-LAN**
+10. Localhost bind or reverse proxy + auth on :8100 (S4 risk note). Sandbox is
+    docker-exec-level convenience, never run it for untrusted agents (§7).
+
+**Open design question**
+11. Claim lease + strict Algorithm-2 ⊥ can strand a single-node run in a single-agent
+    deployment if the agent redirects it (stall until `retry_node`). Acceptable today
+    (UI retry clears it) — if it bites, age out `routed_past` after N minutes instead
+    of clearing it only on user retry.

@@ -64,6 +64,8 @@ def validate(nodes: Dict[str, Node], known_tools: Iterable[str],
             errors.append(f"{n.id}: tool node needs a success_predicate (tool not auto-approved)")
         if n.type == NodeType.LOOP and (not n.condition or n.max_iterations < 1):
             errors.append(f"{n.id}: loop node needs condition and max_iterations >= 1")
+        if n.type == NodeType.LOOP and not n.tool:
+            errors.append(f"{n.id}: loop node needs a tool (its iterated body)")
     if errors:  # structural errors make graph checks meaningless
         return errors
     if not nx.is_directed_acyclic_graph(g):
@@ -122,6 +124,7 @@ def apply_patch(nodes: Dict[str, Node], patch: Patch, known_tools: Iterable[str]
                     n.state = NodeState.PENDING
                     n.attempts = 0
                     n.hint = ""
+                    n.routed_past = []   # user fix resets Alg-2 visited set
             else:
                 errors.append(f"retry_node: unknown node {op.node_id}")
         else:

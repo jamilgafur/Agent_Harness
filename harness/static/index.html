@@ -16,6 +16,7 @@
   button, input, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
   button { cursor:pointer; } button:hover { border-color:#58a6ff; }
   textarea { width:100%; min-height:64px; font-size:12px; }
+  .tabbtn.on { border-color:#58a6ff; color:#58a6ff; }
   #viewport { position:relative; height:52vh; min-height:340px; border:1px solid var(--line); border-top:none; overflow:hidden; background:
       radial-gradient(circle, #1d2530 1px, transparent 1px) 0 0/24px 24px, var(--bg); cursor:grab; margin:0 14px; border-radius:0 0 8px 8px; }
   #viewport:active { cursor:grabbing; }
@@ -32,13 +33,18 @@
   .node.needsApproval rect { animation:flash 1s infinite; }
   @keyframes pulse { 0%,100%{stroke-opacity:1} 50%{stroke-opacity:.35} }
   @keyframes flash { 0%,100%{stroke:#e3b341; stroke-width:1.8} 50%{stroke:#ffd757; stroke-width:4} }
+  .nw.born { animation:pop .45s ease; }
+  @keyframes pop { from { opacity:0; transform:scale(.55); } }
   .edge { fill:none; stroke:#3b4654; stroke-width:1.6; }
   .edge.done { stroke:#3fb95066; }
+  .edge.born { stroke-dasharray:700; stroke-dashoffset:700; animation:dashin .6s ease forwards; }
+  @keyframes dashin { to { stroke-dashoffset:0; } }
   .agent { pointer-events:none; }
   .agent circle { fill:#0b0f14; stroke-width:2.2; }
   .agent text { fill:var(--fg); font-size:10px; font-weight:bold; }
   .agent .ph { font-size:9px; fill:var(--dim); }
   .agent.needhelp .q { fill:#e3b341; font-size:15px; font-weight:bold; }
+  .trail { fill:none; stroke-width:2.4; pointer-events:none; opacity:.55; }
   #log { height:130px; overflow:auto; font-size:12px; }
   #log div { padding:1px 4px; border-radius:4px; }
   #log .warn { color:#e3b341; } #log .error { color:#f85149; }
@@ -48,6 +54,43 @@
   .agrow { display:flex; gap:10px; flex-wrap:wrap; }
   .acard { border:1px solid var(--line); border-radius:8px; padding:6px 10px; min-width:150px; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+  /* ---------- n8n-style node cards ---------- */
+  .node .card { fill:#1a2230; stroke:#2f3946; stroke-width:1.2; filter:drop-shadow(0 3px 6px #0007); rx:10; }
+  .node:hover .card { stroke:#58a6ff; }
+  .node .rail { rx:3; }
+  .node .port { fill:#0b0f14; stroke:#6e7c8e; stroke-width:1.6; }
+  .node .icon { font-size:19px; }
+  .node .t1 { fill:var(--fg); font-size:11.5px; font-weight:bold; }
+  .node .t2 { fill:var(--fg); font-size:11px; opacity:.85; }
+  .node .bdg circle { fill:#e3b341; }
+  .node .bdg text { fill:#111; font-size:11px; font-weight:bold; }
+  .node.DONE .rail { fill:#3fb950; } .node.DONE .port.out { fill:#3fb950; stroke:#3fb950; }
+  .node.RUNNING .rail { fill:#58a6ff; animation:railpulse 1.4s infinite; }
+  .node.WAITING .rail { fill:#d29922; }
+  .node.REPAIRING .rail { fill:#e3b341; }
+  .node.FAILED .rail, .node.BLOCKED .rail { fill:#f85149; }
+  .node.ESCALATED .rail { fill:#bc4cf0; }
+  .node.PENDING .rail { fill:#6e7c8e; }
+  .node.RUNNING .card { stroke:#58a6ff; }
+  .node.needsApproval .card { animation:flash 1s infinite; }
+  .node.needsApproval .bdg { animation:bob 1s infinite; }
+  .resdot { fill:#3fb950; }
+  .outnode { cursor:pointer; }
+  .outnode .card { fill:#142018; stroke:#3fb95088; }
+  .outnode:hover .card { stroke:#3fb950; }
+  @keyframes railpulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  @keyframes bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
+  /* ---------- n8n-style run tabs ---------- */
+  #tabbar { display:flex; gap:2px; align-items:flex-end; padding:0 14px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:37px; z-index:5; }
+  .tab { display:inline-flex; align-items:center; gap:2px; border:1px solid transparent; border-bottom:none; background:transparent; color:var(--dim);
+         border-radius:8px 8px 0 0; padding:7px 12px 6px; font-size:12px; max-width:300px;
+         overflow:hidden; white-space:nowrap; cursor:pointer; }
+  .tab:hover { color:var(--fg); background:#161d26; }
+  .tab.on { color:var(--fg); background:var(--bg); border-color:var(--line); position:relative; margin-bottom:-1px; padding-bottom:7px; }
+  .tab .tdot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
+  .tab .tdel { margin-left:10px; padding:0 6px; border-radius:6px; color:#f85149; opacity:.75; font-weight:bold; }
+  .tab .tdel:hover { opacity:1; background:#f8514926; }
+  .tab.plus { color:#58a6ff; font-size:15px; padding:6px 11px; }
   .dot.on { background:#3fb950; } .dot.off { background:#555; }
 </style>
 </head>
@@ -57,32 +100,28 @@
   <span class="chip" id="health">…</span>
   <span class="chip" id="attention"></span>
   <span class="chip" id="agentcount"></span>
-  <span class="chip"><button onclick="fit()">fit</button><button onclick="zoom(1.25)">+</button><button onclick="zoom(0.8)">−</button></span>
+  <span class="chip" id="metrics" title="TSR · avg latency · delegation depth · first-pass"></span>
+  <span class="chip"><button onclick="fit()">fit all</button><button onclick="zoom(1.25)">+</button><button onclick="zoom(0.8)">−</button></span>
+  <button onclick="showHelp()" title="how this works" style="font-size:14px;padding:4px 11px">ⓘ</button>
 </header>
 
-<div class="panel row">
-  <input id="intent" placeholder="new run intent (LLM decomposes it)…" style="flex:1;min-width:260px">
-  <button onclick="createIntent()">run</button>
-  <button onclick="tpbox.style.display=tpbox.style.display==='none'?'block':'none'">template DAG</button>
-  <span id="runs" class="row"></span>
-</div>
-<div class="panel" id="tpbox" style="display:none">
-  <textarea id="template"></textarea>
-  <div class="row" style="margin-top:6px"><button onclick="createTemplate()">import template</button>
-  <span class="chip">validated on import; runs unaided when tools are auto-approved</span></div>
-</div>
+<div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showOutput()" title="results of the selected run">📄 output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
 
 <div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
 <div class="panel agrow" id="agents"></div>
 <div class="panel"><b>Node</b> <span id="detailhint" class="chip">click a node</span><div id="detail"></div></div>
+<div class="panel"><b>Workspace files</b> <button onclick="loadFiles()">refresh</button> <span class="chip" id="filespath"></span>
+  <div id="files" class="row" style="max-height:110px;overflow:auto;margin-top:6px"></div></div>
 <div class="panel"><b>Events</b><div id="log"></div></div>
 
 <div id="modal"><div class="panel card"><div id="modalbody"></div></div></div>
 
 <script>
 // ---------- state ----------
-let RUN=null, NODES={}, PENDING=new Set(), AGENTS={}, STATS={}, WS=null;
-let view={x:40,y:30,k:1}; const W=200,H=60,CW=270,RH=86;
+let RUN=null, ALL={}, AGENTS={}, WS=null;      // ALL: run_id -> {intent,created,nodes,stats,active,pending:Set}
+let FOREST={};                                  // run_id -> {pos:{nid:{x,y}}, yOff, h}  (set by draw)
+const SEEN=new Set(), POSPREV={}, AGPOS={}, ANIM={};
+let view={x:40,y:30,k:1}; const W=228,H=64,CW=320,RH=88;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined});
@@ -91,79 +130,217 @@ const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'content-type'
 // ---------- boot / ws ----------
 async function boot(){
   const h=await api('GET','/health'); $('health').textContent=`core ✓ ollama ${h.ollama?'✓':'✗'}`;
-  $('template').value=JSON.stringify({nodes:[
-    {id:"w",intent:"write welcome file",tool:"write_file",args:{path:"hello.txt",content:"hi from the harness\n"}},
-    {id:"r",intent:"show the file",tool:"shell",args:{cmd:"cat hello.txt"},deps:["w"]}]},null,2);
-  await refreshRuns(); ws();
+  await refreshRuns(); ws(); loadFiles(); requestAnimationFrame(tick);
 }
 function ws(){
   const s=new WebSocket(`ws://${location.host}/ws`); WS=s;
   s.onmessage=ev=>{const m=JSON.parse(ev.data);
-    if(m.type==='state'){ if(m.run_id===RUN){applyState(m);} }
-    if(m.type==='agents'){AGENTS=m.agents; drawAgents(); drawAgentsPanel(); attention();}
+    if(m.type==='state'){ const r=ALL[m.run_id]||(ALL[m.run_id]={});
+      r.nodes=m.nodes; r.stats=m.stats; r.active=m.active; r.pending=new Set(m.pending||[]);
+      drawTabs(); attention(); if(m.run_id===RUN){draw(); loadFiles();} }
+    if(m.type==='agents'){AGENTS=m.agents; drawAgentsPanel(); attention();}
     if(m.type==='log'){ if(m.event.run_id===RUN) logLine(m.event); }
-    if(m.type==='approval'){ attention(); if(m.approval.run_id===RUN){ PENDING=new Set(m.approval.status==='pending'?[...PENDING,m.approval.node_id]:[...PENDING].filter(x=>x!==m.approval.node_id)); draw(); } }
-    if(m.type==='run'||m.type==='run_deleted') refreshRuns();
+    if(m.type==='approval'){ attention(); const r=ALL[m.approval.run_id];
+      if(r){ r.pending=r.pending||new Set();
+        m.approval.status==='pending'?r.pending.add(m.approval.node_id):r.pending.delete(m.approval.node_id); draw(); } }
+    if(m.type==='run'){ refreshRuns(); }
+    if(m.type==='run_deleted'){ delete ALL[m.run_id]; if(RUN===m.run_id){RUN=null;$('detail').textContent='';} refreshRuns(); }
   };
   s.onclose=()=>setTimeout(ws,3000);
 }
 async function refreshRuns(){
   const runs=await api('GET','/runs');
-  $('runs').innerHTML=runs.map(r=>`<button class="${r.id===RUN?'attn chip':''}" onclick="selRun('${r.id}')" title="${esc(r.intent)}">${r.id}${r.active?'':' ✓'}</button>${r.active?'':`<button onclick="delRun('${r.id}','${r.id}')" title="delete">🗑</button>`}`).join('')||'<span class="chip">no runs yet</span>';
-  if(!RUN&&runs[0]) selRun(runs[0].id);
+  const ids=new Set(runs.map(r=>r.id));
+  for(const r of runs.slice(0,12)){
+    const s=await api('GET',`/runs/${r.id}`);
+    ALL[r.id]={intent:r.intent,created:r.created,nodes:s.nodes,stats:s.stats,active:s.active,pending:new Set(s.pending||[])};
+  }
+  for(const id of Object.keys(ALL)) if(!ids.has(id)) delete ALL[id];
+  if(!RUN&&runs[0]) RUN=runs[0].id;
+  if(RUN&&!ALL[RUN]) RUN=runs[0]?runs[0].id:null;
+  drawTabs();
+  if(RUN){ $('log').innerHTML=''; (await api('GET',`/runs/${RUN}/events`)).forEach(logLine); draw(); fit(); }
+  const m=await api('GET','/metrics');
+  const t=m.total;
+  $('metrics').textContent=t.tsr_pct===null?'no finished runs'
+    :`TSR ${t.tsr_pct}% · ${(t.avg_latency_ms/1000).toFixed(0)}s · depth ${t.max_delegation_depth} · 1st-pass ${t.first_pass_pct}%`;
+  attention();
 }
-async function selRun(id){
-  RUN=id; NODES={}; PENDING=new Set(); $('log').innerHTML='';
-  const r=await api('GET',`/runs/${id}`); applyState({nodes:r.nodes,stats:r.stats,pending:r.pending||[],active:r.active});
-  (await api('GET',`/runs/${id}/events`)).forEach(logLine);
+function drawTabs(){
+  $('tabs').innerHTML=Object.entries(ALL).sort((a,b)=>(b[1].created||0)-(a[1].created||0)).map(([rid,r])=>{
+    const nodes=Object.values(r.nodes||{}), total=nodes.length, done=nodes.filter(n=>n.state==='DONE').length;
+    const pend=(r.pending||new Set()).size, esc_=nodes.filter(n=>n.state==='ESCALATED').length;
+    const color=pend+esc_?'#e3b341':r.active?'#58a6ff':(done===total&&total?'#3fb950':'#8b949e');
+    return `<span class="tab ${rid===RUN?'on':''}" title="${esc(r.intent||'')}">
+      <span onclick="selRun('${rid}')"><span class="tdot" style="background:${color}"></span>${esc(rid)} · ${esc((r.intent||'').slice(0,26))} · ${done}/${total}${r.active?'':' ✓'}</span>
+      <span class="tdel" title="delete run" onclick="delRun('${rid}')">✕</span></span>`;
+  }).join('');
 }
-async function delRun(id){ if(!confirm('delete run '+id+'?'))return; await api('DELETE',`/runs/${id}`); if(RUN===id){RUN=null;$('world').innerHTML='';refresh();} refreshRuns(); }
-function applyState(m){ NODES=m.nodes; STATS=m.stats; PENDING=new Set(m.pending||[]); draw(); attention(); }
-function refresh(){ const s=Object.entries(NODES).length?{nodes:NODES,stats:STATS,pending:[...PENDING]}:null; if(s)draw(); }
+async function selRun(rid){
+  if(!ALL[rid]||rid===RUN)return;
+  RUN=rid; $('log').innerHTML=''; $('detail').textContent=''; $('detailhint').textContent='click a node';
+  (await api('GET',`/runs/${rid}/events`)).forEach(logLine);
+  drawTabs(); draw(); fit();
+}
+async function delRun(rid){
+  const active=ALL[rid]&&ALL[rid].active;
+  if(!confirm(active?`run ${rid} is ACTIVE — stop it and delete?`:'delete run '+rid+'?'))return;
+  await api('DELETE',`/runs/${rid}${active?'?force=1':''}`); delete ALL[rid];
+  refreshRuns();
+}
 
-// ---------- layout ----------
-function layout(){
-  const nodes=Object.values(NODES); const byD={};
-  nodes.forEach(n=>{(byD[n.depth]=byD[n.depth]||[]).push(n);});
-  Object.values(byD).forEach(col=>col.sort((a,b)=>a.id.localeCompare(b.id)));
-  const maxCol=Math.max(1,...Object.values(byD).map(c=>c.length));
-  const pos={};
-  Object.entries(byD).forEach(([d,col])=>{
-    const off=(maxCol-col.length)*RH/2;
-    col.forEach((n,i)=>{pos[n.id]={x:Number(d)*CW, y:off+i*RH};});
-  });
-  return pos;
+// ---------- workspace files panel ----------
+let FILESDIR='';
+async function loadFiles(dir){
+  FILESDIR=dir??FILESDIR;
+  try{
+    const f=await api('GET','/workspace/files?path='+encodeURIComponent(FILESDIR||'.'));
+    $('filespath').textContent='/'+(FILESDIR||'');
+    $('files').innerHTML=(FILESDIR?`<button onclick="loadFiles('')">..</button>`:'')+
+      (f.entries||[]).map(e=>e.endsWith('/')
+        ?`<button onclick="loadFiles('${esc((FILESDIR?FILESDIR+'/':'')+e.slice(0,-1))}')">📁 ${esc(e)}</button>`
+        :`<button onclick="showFile('${esc((FILESDIR?FILESDIR+'/':'')+e)}')">${esc(e)}</button>`).join('')
+      ||'<span class="chip">empty</span>';
+  }catch(e){$('files').innerHTML='<span class="chip">sandbox unreachable</span>';}
+}
+async function showFile(p){
+  const f=await api('GET','/workspace/file?path='+encodeURIComponent(p));
+  $('modalbody').innerHTML=`<b>${esc(p)}</b>
+    <textarea readonly style="min-height:300px;margin-top:6px">${esc(f.content)}</textarea>
+    <div class="row" style="margin-top:8px"><button onclick="$('modal').style.display='none'">close</button></div>`;
+  $('modal').style.display='flex';
 }
 
-// ---------- draw ----------
+// ---------- tidy tree layout (per run) ----------
+function layoutRun(r){
+  const nodes=Object.values(r.nodes||{}); if(!nodes.length)return {pos:{},h:0};
+  const byId=Object.fromEntries(nodes.map(n=>[n.id,n]));
+  const primary=n=>{ if(n.parent&&byId[n.parent])return n.parent;
+    const d=n.deps||[]; return d.length&&byId[d[0]]?d[0]:null; };
+  const kids={};
+  nodes.forEach(n=>{const p=primary(n); if(p)(kids[p]=kids[p]||[]).push(n.id);});
+  Object.values(kids).forEach(k=>k.sort());
+  const roots=nodes.filter(n=>!primary(n)).map(n=>n.id).sort();
+  const pos={}; let nextY=0;
+  const place=(id,d)=>{
+    const c=kids[id]||[]; let y;
+    if(c.length){ const ys=c.map(ch=>place(ch,d+1)); y=(ys[0]+ys[ys.length-1])/2; }
+    else { y=nextY*RH; nextY++; }
+    pos[id]={x:d*CW,y}; return y;
+  };
+  roots.forEach(rid=>{place(rid,0); nextY+=0.6;});
+  nodes.forEach(n=>{ if(!pos[n.id]){ pos[n.id]={x:(n.depth||0)*CW,y:nextY*RH}; nextY++; } });
+  return {pos,h:nextY*RH};
+}
+
+// ---------- n8n skin helpers ----------
+const ICON=n=>n.type==='loop'?'⟳':!n.tool?'✦':n.tool.startsWith('mcp_')?'🔌'
+  :({shell:'⌘',write_file:'📄',read_file:'📖',list_dir:'📁',web_search:'🔍',http_fetch:'🌐',llm:'✍️'}[n.tool]||'⚙️');
+function clampTitle(s){ s=String(s||''); return [s.slice(0,24), s.length>24 ? s.slice(24,44)+(s.length>44?'…':'') : '']; }
+
+// ---------- draw the selected run ----------
 function draw(){
-  const pos=layout(), g=$('world'); let html='';
-  for(const n of Object.values(NODES)){
-    for(const d of n.deps){
-      if(!NODES[d]||!pos[d]||!pos[n.id])continue;
-      const p0=pos[d],p1=pos[n.id],x0=p0.x+W,y0=p0.y+H/2,x1=p1.x,y1=p1.y+H/2,mx=(x1-x0)/2;
-      html+=`<path class="edge ${NODES[d].state==='DONE'?'done':''}" d="M${x0},${y0} C${x0+mx},${y0} ${x1-mx},${y1} ${x1},${y1}"/>`;
+  const r=ALL[RUN]; let html=''; FOREST={};
+  if(!r){
+    html=`<text x="40" y="60" fill="#8b949e" font-size="14">no runs — hit ＋ to let the AI build one</text>`;
+  } else {
+    const {pos}=layoutRun(r); FOREST[RUN]={pos,yOff:0};
+    for(const n of Object.values(r.nodes||{})){
+      for(const d of n.deps||[]){
+        const p0=pos[d],p1=pos[n.id]; if(!p0||!p1)continue;
+        const x0=p0.x+W,yy0=p0.y+H/2,x1=p1.x,yy1=p1.y+H/2,mx=Math.max(60,(x1-x0)/2);
+        const ekey=`${d}>${n.id}`, born=!SEEN.has(ekey); SEEN.add(ekey);
+        html+=`<path class="edge ${r.nodes[d].state==='DONE'?'done':''} ${born?'born':''}" d="M${x0},${yy0} C${x0+mx},${yy0} ${x1-mx},${yy1} ${x1},${yy1}"/>`;
+      }
+    }
+    for(const n of Object.values(r.nodes||{})){
+      const p=pos[n.id]; if(!p)continue;
+      const need=(r.pending||new Set()).has(n.id);
+      const key=n.id, born=!SEEN.has(key); SEEN.add(key);
+      const [t1,t2]=clampTitle(n.intent);
+      html+=`<g class="node ${n.state} ${need?'needsApproval':''}" data-nid="${esc(n.id)}" transform="translate(${p.x},${p.y})"><g class="nw ${born?'born':''}">
+        <rect class="card" width="${W}" height="${H}"/>
+        <rect class="rail" x="0" y="0" width="6" height="${H}"/>
+        <circle class="port in" cx="0" cy="${H/2}" r="5"/><circle class="port out" cx="${W}" cy="${H/2}" r="5"/>
+        <text class="icon" x="22" y="${H/2+7}">${ICON(n)}</text>
+        <text class="t1" x="54" y="24">${esc(t1)}</text>
+        <text class="t2" x="54" y="38">${esc(t2)}</text>
+        <text class="sub" x="54" y="54">${esc(n.tool||'abstract')} · ${n.state}${n.attempts>1?' ×'+n.attempts:''}${n.hint?' — ⚠ '+esc(n.hint.slice(0,16)):''}</text>
+        ${need?`<g class="bdg"><circle cx="${W-16}" cy="6" r="10"/><text x="${W-16}" y="10" text-anchor="middle">!</text></g>`:''}
+        ${n.result!=null?`<circle class="resdot" cx="${W-16}" cy="${need?26:6}" r="4" title="has output"/>`:''}
+      </g></g>`;
+    }
+    // virtual RESULTS sink: the run's outputs as a first-class node on the DAG
+    const produced=Object.values(r.nodes||{}).filter(n=>n.result!=null);
+    const xs=Object.values(pos).map(p=>p.x);
+    if(produced.length&&xs.length){
+      const consumed=new Set(Object.values(r.nodes).flatMap(n=>[n.parent,...(n.deps||[])].filter(Boolean)));
+      const sinks=Object.values(r.nodes).filter(n=>!consumed.has(n.id)&&n.result!=null);
+      const ox=Math.max(...xs)+CW;
+      const oys=sinks.map(n=>pos[n.id].y);
+      const oy=oys.length?(Math.min(...oys)+Math.max(...oys))/2:0;
+      FOREST[RUN].pos['$output']={x:ox,y:oy};
+      for(const s of sinks){
+        const x0=pos[s.id].x+W,yy0=pos[s.id].y+H/2,mx=Math.max(60,(ox-x0)/2);
+        html+=`<path class="edge done" d="M${x0},${yy0} C${x0+mx},${yy0} ${ox-mx},${oy+H/2} ${ox},${oy+H/2}"/>`;
+      }
+      html+=`<g class="node outnode" data-out="1" transform="translate(${ox},${oy})"><g class="nw">
+        <rect class="card" width="${W}" height="${H}"/>
+        <rect class="rail" x="0" y="0" width="6" height="${H}" style="fill:#3fb950"/>
+        <circle class="port in" cx="0" cy="${H/2}" r="5"/>
+        <text class="icon" x="22" y="${H/2+7}">📄</text>
+        <text class="t1" x="54" y="24">RESULTS</text>
+        <text class="sub" x="54" y="44">${produced.length} node${produced.length===1?'':'s'} produced output — click to read</text>
+      </g></g>`;
     }
   }
-  for(const n of Object.values(NODES)){
-    const p=pos[n.id]; if(!p)continue;
-    const need=PENDING.has(n.id);
-    const tool=n.tool?`⚙ ${n.tool}`:'◈ decomposed/abstract';
-    html+=`<g class="node ${n.state} ${need?'needsApproval':''}" data-nid="${esc(n.id)}" transform="translate(${p.x},${p.y})">
-      <rect width="${W}" height="${H}"/><text x="10" y="18">${esc(n.id.length>22?n.id.slice(0,21)+'…':n.id)}  · ${n.state}${n.attempts>1?' ×'+n.attempts:''}</text>
-      <text class="sub" x="10" y="34">${esc(n.intent.length>34?n.intent.slice(0,33)+'…':n.intent)||' '}</text>
-      <text class="sub" x="10" y="49">${esc(tool)}${n.hint?' — ⚠ '+esc(n.hint.slice(0,24)):''}</text></g>`;
-  }
-  g.innerHTML=html;
-  g.querySelectorAll('.node').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();clickNode(el.dataset.nid);}));
-  applyView(); drawAgents();
+  const world=$('world'); world.innerHTML=html;
+  world.querySelectorAll('.node:not([data-out])').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();clickNode(el.dataset.nid);}));
+  world.querySelectorAll('.node[data-out]').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();showOutput();}));
+  // FLIP: glide nodes that moved since last layout
+  world.querySelectorAll('.node').forEach(el=>{
+    const key=el.dataset.nid; if(!key)return;
+    const m=/translate\(([-\d.e]+),([-\d.e]+)\)/.exec(el.getAttribute('transform')||'');
+    if(!m)return; const nx=+m[1],ny=+m[2], prev=POSPREV[key];
+    if(prev&&(Math.abs(prev.x-nx)>1||Math.abs(prev.y-ny)>1))
+      el.animate([{transform:`translate(${prev.x}px,${prev.y}px)`},{transform:`translate(${nx}px,${ny}px)`}],
+                 {duration:380,easing:'ease-in-out'});
+    POSPREV[key]={x:nx,y:ny};
+  });
+  applyView();
 }
+
+// ---------- agents ride edges ----------
+function cubicPt(p0,p1,s){
+  const dx=Math.abs(p1.x-p0.x)/2+30, c1={x:p0.x+dx,y:p0.y}, c2={x:p1.x-dx,y:p1.y}, u=1-s;
+  return {x:u*u*u*p0.x+3*u*u*s*c1.x+3*u*s*s*c2.x+s*s*s*p1.x,
+          y:u*u*u*p0.y+3*u*u*s*c1.y+3*u*s*s*c2.y+s*s*s*p1.y};
+}
+function tick(){ drawAgents(); requestAnimationFrame(tick); }
 function drawAgents(){
-  const pos=layout(), L=$('agentlayer');
+  const L=$('agentlayer'); if(!L)return;
+  for(const [id,a] of Object.entries(AGENTS)){
+    if(!a.node_id||!FOREST[a.run_id])continue;
+    const f=FOREST[a.run_id], p=f.pos[a.node_id]; if(!p)continue;
+    const t={x:p.x+W-34,y:p.y+f.yOff-24};
+    const prev=AGPOS[id];
+    if(!prev||Math.abs(prev.x-t.x)>1||Math.abs(prev.y-t.y)>1)
+      ANIM[id]={p0:prev?{...prev}:t,p1:t,t0:performance.now(),dur:650};
+  }
+  for(const [id,an] of Object.entries(ANIM)){
+    const e=Math.min(1,(performance.now()-an.t0)/an.dur), s=e<.5?2*e*e:-1+(4-2*e)*e;
+    AGPOS[id]=e<1?cubicPt(an.p0,an.p1,s):{...an.p1};
+    if(e>=1)delete ANIM[id];
+  }
   const hue=s=>[...s].reduce((a,c)=>a+c.charCodeAt(0),0)%360;
-  L.innerHTML=Object.entries(AGENTS).filter(([_,a])=>a.node_id&&NODES[a.node_id]&&pos[NODES[a.node_id]]).map(([id,a])=>{
-    const p=pos[NODES[a.node_id]], need=PENDING.has(NODES[a.node_id].id);
-    return `<g class="agent ${need?'needhelp':''}" style="transform:translate(${p.x+W-34}px,${p.y-24}px);transition:transform .7s">
+  L.innerHTML=Object.entries(AGENTS).map(([id,a])=>{
+    const g=AGPOS[id]; if(!g)return '';
+    const an=ANIM[id]; let trail='';
+    if(an){ const e=Math.min(1,(performance.now()-an.t0)/an.dur), s2=Math.max(0,(e<.5?2*e*e:-1+(4-2*e)*e)-0.14);
+      const b=cubicPt(an.p0,an.p1,s2);
+      trail=`<line class="trail" x1="${b.x+14}" y1="${b.y+14}" x2="${g.x+14}" y2="${g.y+14}" style="stroke:hsl(${hue(id)},70%,55%)"/>`; }
+    const need=a.node_id&&ALL[a.run_id]&&(ALL[a.run_id].pending||new Set()).has(a.node_id);
+    return `${trail}<g class="agent ${need?'needhelp':''}" style="transform:translate(${g.x}px,${g.y}px)">
       <circle cx="14" cy="14" r="13" style="stroke:${a.alive?`hsl(${hue(id)},70%,55%)`:'#555'}"/>
       <text x="14" y="18" text-anchor="middle">${esc(id.replace(/^agent-?/,'')[0]||'A').toUpperCase()}</text>
       ${need?'<text class="q" x="24" y="4">?</text>':`<text class="ph" x="28" y="20">${esc(a.phase.slice(0,12))}</text>`}</g>`;
@@ -177,58 +354,175 @@ function drawAgentsPanel(){
   $('agentcount').textContent=`agents: ${Object.values(AGENTS).filter(a=>a.alive).length}`;
 }
 async function attention(){
-  const pend=(await api('GET','/approvals?status=pending')).length;
-  const esc_ = Object.values(NODES).filter(n=>n.state==='ESCALATED').length;
-  $('attention').textContent=`⚑ ${pend+esc_} need you`; $('attention').className='chip'+(pend+esc_?' attn':'');
+  const pending=await api('GET','/approvals?status=pending');
+  const esc_=Object.values(ALL).reduce((s,r)=>s+Object.values(r.nodes||{}).filter(n=>n.state==='ESCALATED').length,0);
+  const total=pending.length+esc_;
+  $('attention').textContent=total
+    ? `⚑ ${total} need you — ${pending.length?`next: ${pending[0].node_id}`:'escalated nodes'}`
+    : '⚑ 0 need you';
+  $('attention').className='chip'+(total?' attn':'');
+  $('attention').style.cursor=total?'pointer':'default';
+  $('attention').onclick=total&&pending.length?()=>openApproval(pending[0]):null;
 }
 
 // ---------- pan / zoom ----------
 let drag=null;
 const vp=$('viewport');
-vp.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y};vp.setPointerCapture(e.pointerId);});
+vp.addEventListener('pointerdown',e=>{if(e.target.closest('.node'))return;drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y};vp.setPointerCapture(e.pointerId);});
 vp.addEventListener('pointermove',e=>{if(!drag)return;view.x=drag.vx+(e.clientX-drag.x);view.y=drag.vy+(e.clientY-drag.y);applyView();});
 vp.addEventListener('pointerup',()=>drag=null);
 vp.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY<0?1.12:0.89;zoomAt(f,e.offsetX,e.offsetY);},{passive:false});
-function zoomAt(f,cx,cy){const k2=Math.min(3,Math.max(.2,view.k*f));view.x=cx-(cx-view.x)*k2/view.k;view.y=cy-(cy-view.y)*k2/view.k;view.k=k2;applyView();}
+function zoomAt(f,cx,cy){const k2=Math.min(3,Math.max(.15,view.k*f));view.x=cx-(cx-view.x)*k2/view.k;view.y=cy-(cy-view.y)*k2/view.k;view.k=k2;applyView();}
 function zoom(f){zoomAt(f,vp.clientWidth/2,vp.clientHeight/2);}
 function applyView(){$('world').setAttribute('transform',`translate(${view.x},${view.y}) scale(${view.k})`);$('agentlayer').setAttribute('transform',`translate(${view.x},${view.y}) scale(${view.k})`);}
 function fit(){
-  const xs=[],ys=[];Object.values(NODES).forEach(n=>{const p=layout()[n.id];if(p){xs.push(p.x);ys.push(p.y);}});
-  if(!xs.length)return;const w=Math.max(...xs)+W+60,h=Math.max(...ys)+H+40;
-  view.k=Math.min(1.4,vp.clientWidth/w,vp.clientHeight/h);view.x=(vp.clientWidth-Math.max(...xs)*view.k)/2;view.y=(vp.clientHeight-Math.max(...ys)*view.k)/2+10;applyView();
+  const f=FOREST[RUN]; if(!f)return;
+  const xs=[],ys=[];
+  for(const p of Object.values(f.pos)){xs.push(p.x);ys.push(p.y);}
+  if(!xs.length)return;
+  const x0=Math.min(...xs),x1=Math.max(...xs)+W,y0=Math.min(...ys)-30,y1=Math.max(...ys)+H;
+  view.k=Math.min(1.3,vp.clientWidth/(x1-x0+60),vp.clientHeight/(y1-y0+40));
+  view.x=vp.clientWidth/2-(x0+x1)/2*view.k;
+  view.y=vp.clientHeight/2-(y0+y1)/2*view.k;
+  applyView();
+}
+
+// ---------- result rendering ----------
+function renderResult(v){
+  if(v==null) return '';
+  if(typeof v!=='object') return String(v);
+  if(Array.isArray(v.results)&&v.results.length&&v.results[0]&&v.results[0].url!==undefined)
+    return v.results.map(x=>`• ${x.title||x.url}\n  ${x.url}`).join('\n');
+  if(v.content!==undefined) return String(v.content).slice(0,1500);
+  if(v.stdout!==undefined) return (v.stdout+(v.stderr?'\n[stderr] '+v.stderr:'')).slice(0,1500)||'(empty output)';
+  if(v.text) return v.text.slice(0,1500);
+  if(v.bytes!==undefined) return `wrote ${v.bytes} bytes`;
+  if(Object.keys(v).length&&Object.values(v).every(x=>x&&typeof x==='object'))
+    return Object.entries(v).map(([k,x])=>`── ${k} ──\n${renderResult(x)}`).join('\n\n').slice(0,2500);
+  return JSON.stringify(v,null,1).slice(0,1500);
+}
+function showHelp(){
+  $('modalbody').innerHTML=`<b>how the harness works</b>
+  <div style="margin-top:6px;color:var(--dim);font-size:12px;line-height:1.6">
+  <b style="color:var(--fg)">1 · Ask.</b> Hit ＋, type one sentence —
+  <i>tell me about…</i>, <i>write a research paper on…</i>, <i>add tests to…</i>.
+  The planner LLM decomposes it into a task <b>DAG</b> you can watch grow.<br>
+  <b style="color:var(--fg)">2 · Watch.</b> Agents (colored chips) ride the wires to nodes they claim.
+  Card rail: <span style="color:#58a6ff">blue</span> running · <span style="color:#3fb950">green</span> done ·
+  <span style="color:#d29922">amber</span> waiting · <span style="color:#f85149">red</span> failed ·
+  <span style="color:#bc4cf0">purple</span> needs a decision. Icons: 🔍 search · 🌐 fetch · 📄 files · ⌘ shell · ✍️ synthesis.<br>
+  <b style="color:var(--fg)">3 · Gate.</b> Read-only work runs unaided; mutations flash — click the card,
+  edit the JSON, approve or reject. Every plan is validated server-side (bad ones bounce for self-repair).<br>
+  <b style="color:var(--fg)">4 · Read.</b> For knowledge tasks the last node is ✍️ <b>synthesis</b>: the model reads
+  everything its DAG ancestors gathered (green dot = output produced) and writes the answer.
+  Open the <b>📄 RESULTS</b> node at the right end of the canvas.<br>
+  <b style="color:var(--fg)">Controls</b> — drag background to pan · wheel to zoom · <i>fit all</i> recenters ·
+  click a card for details + its readable result · tabs switch runs · ✕ deletes finished runs.<br>
+  <b style="color:var(--fg)">Safety rails</b> — per-run budgets (max LLM calls / seconds / depth / nodes) with a
+  governor that terminates (keeps work) on breach; full event audit in the log panel and <i>events.jsonl</i>.</div>
+  <div class="row" style="margin-top:10px"><button onclick="$('modal').style.display='none'">got it</button></div>`;
+  $('modal').style.display='flex';
+}
+function showOutput(){
+  const r=ALL[RUN]; if(!r)return;
+  const root=(r.nodes||{})['root'];
+  const body=(root&&root.result!=null)?renderResult(root.result)
+    :renderResult(Object.fromEntries(Object.entries(r.nodes||{}).filter(([k,n])=>n.result!=null).map(([k,n])=>[k,n.result])));
+  $('modalbody').innerHTML=`<b>📄 final output — ${esc((r.intent||RUN||'').slice(0,60))}</b>
+    <div style="margin-top:8px;color:var(--fg);white-space:pre-wrap;font-size:13px;line-height:1.55;max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px 16px;background:#0d1420">${esc(body||'nothing produced yet — the run is still working')}</div>
+    <div class="row" style="margin-top:8px"><button onclick="$('modal').style.display='none'">close</button></div>`;
+  $('modal').style.display='flex';
 }
 
 // ---------- node interactions ----------
 async function clickNode(nid){
-  const pend=(await api('GET','/approvals?status=pending')).find(a=>a.node_id===nid&&a.run_id===RUN);
+  const rid=RUN; if(!rid)return;
+  const pend=(await api('GET','/approvals?status=pending')).find(a=>a.node_id===nid&&a.run_id===rid);
   if(pend) return openApproval(pend);
-  const n=NODES[nid];
-  $('detail').textContent=JSON.stringify(n,null,2);
-  if(['ESCALATED','FAILED'].includes(n.state))
-    $('detail').innerHTML+=`\n<button onclick="retry('${nid}')">fix &amp; retry</button>`;
+  const r=ALL[rid]; if(!r)return; const n=(r.nodes||{})[nid]; if(!n)return;
+  $('detailhint').textContent=`${rid} / ${nid}`;
+  const stColor={DONE:'#3fb950',RUNNING:'#58a6ff',WAITING:'#d29922',REPAIRING:'#e3b341',
+                 FAILED:'#f85149',BLOCKED:'#f85149',ESCALATED:'#bc4cf0',PENDING:'#8b949e'}[n.state]||'#8b949e';
+  const rows=[['intent',n.intent],['tool',n.tool||'(planner — LLM decomposes this)'],
+      n.success_predicate?['success when',n.success_predicate]:null,
+      n.attempts>1?['attempts',n.attempts]:null,
+      n.hint?['⚠ hint',n.hint]:null].filter(Boolean);
+  $('detail').innerHTML=
+    `<div style="margin:4px 0"><span style="background:${stColor}22;color:${stColor};border:1px solid ${stColor};padding:2px 12px;border-radius:10px;font-weight:bold">${n.state}</span></div>
+     <table style="border-collapse:collapse">${rows.map(([k,v])=>
+       `<tr><td style="color:var(--dim);padding:1px 10px 1px 0;vertical-align:top">${k}</td><td style="color:var(--fg)">${esc(v)}</td></tr>`).join('')}</table>
+     ${n.result!=null?`<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:6px;color:var(--fg);white-space:pre-wrap">${esc(renderResult(n.result))}</div>`:''}
+     ${['ESCALATED','FAILED'].includes(n.state)?`<div style="margin-top:8px"><button onclick="retry('${rid}','${nid}')">fix &amp; retry</button></div>`:''}`;
 }
-async function retry(id){await api('POST',`/runs/${RUN}/patch`,{ops:[{op:"retry_node",node_id:id}],reason:"user fix"});}
+async function retry(rid,nid){await api('POST',`/runs/${rid}/patch`,{ops:[{op:"retry_node",node_id:nid}],reason:"user fix"});}
 function openApproval(a){
-  const editable = a.kind==='patch' ? {children:a.args.children} : a.args;
-  $('modalbody').innerHTML=`<b>${a.kind==='patch'?'DAG edit (decompose)':'Tool execution'} — ${esc(a.node_id)}</b>
-    ${a.kind==='patch'?`<div class="sub">children about to be added under <b>${esc(a.node_id)}</b>; edit the JSON, then approve.</div>`
-      :`<div class="sub">tool <b>${esc(a.tool)}</b>; edit args, then approve.</div>`}
-    <textarea id="modargs" style="min-height:${a.kind==='patch'?'240':'140'}px">${esc(JSON.stringify(editable,null,2))}</textarea>
-    <div class="row" style="margin-top:8px"><button onclick="decide('${a.id}',true)">approve${a.kind==='patch'?' (apply edits)':''}</button>
-    <button onclick="decide('${a.id}',false)">reject</button><button onclick="$('modal').style.display='none'">cancel</button></div>`;
+  let summary;
+  if(a.kind==='patch'){
+    summary=`<div style="color:var(--dim);margin:4px 0">the agent wants to split <b style="color:var(--fg)">${esc(a.node_id)}</b> into these subtasks:</div>`+
+      (a.args.children||[]).map((c,i)=>`<div style="border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:4px 0">
+        <b>${i+1}. ${esc(c.intent||'')}</b>
+        <div style="color:var(--dim);font-size:11.5px;margin-top:2px">tool: <b>${esc(c.tool||'planner')}</b>
+        ${c.deps&&c.deps.length?` · after step ${c.deps.map(d=>d+1).join(', ')}`:''}
+        ${c.success_predicate?` · done when: ${esc(c.success_predicate)}`:''}</div></div>`).join('');
+  } else {
+    summary=`<div style="color:var(--dim);margin:4px 0">the agent wants to run:</div>
+      <div style="border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:4px 0">
+        <b>${esc(a.tool)}</b><div style="color:var(--dim);font-size:11.5px;margin-top:3px;white-space:pre-wrap">${esc(renderResult(a.args))}</div></div>`;
+  }
+  const editable=a.kind==='patch'?{children:a.args.children}:a.args;
+  $('modalbody').innerHTML=`<b>⏸ next step needs your OK — ${esc(a.node_id)}</b>
+    ${summary}
+    <details style="margin:6px 0"><summary style="cursor:pointer;color:var(--dim)">edit the plan as JSON (advanced)</summary>
+      <textarea id="modargs" style="min-height:160px;margin-top:4px">${esc(JSON.stringify(editable,null,2))}</textarea></details>
+    <div class="row" style="margin-top:8px">
+      <button style="border-color:#3fb950;color:#3fb950;padding:7px 18px" onclick="decide('${a.id}',true)">✔ approve — go ahead</button>
+      <button style="border-color:#f85149;color:#f85149;padding:7px 18px" onclick="decide('${a.id}',false)">✖ reject — rethink</button>
+      <button onclick="$('modal').style.display='none'">later</button></div>`;
   $('modal').style.display='flex';
 }
 async function decide(id,ok){
-  let args; try{args=JSON.parse($('modargs').value);}catch(e){return alert('bad JSON');}
+  let args;
+  const ta=$('modargs');
+  if(ok){ try{args=JSON.parse(ta.value);}catch(e){return alert('bad JSON');} }
   const body = ok ? {decision:'approve',args} : {decision:'reject'};
   const r=await api('POST',`/approvals/${id}`,body);
   logLine({level:r.status==='done'?'info':'warn',msg:`approval ${id}: ${r.status}`});
   $('modal').style.display='none'; attention();
 }
 
-// ---------- runs ----------
-async function createIntent(){const v=$('intent').value.trim();if(!v)return;const r=await api('POST','/runs',{intent:v});$('intent').value='';refreshRuns();selRun(r.run_id);}
-async function createTemplate(){let b;try{b=JSON.parse($('template').value);}catch(e){return alert('bad JSON');}const r=await api('POST','/runs',b);refreshRuns();selRun(r.run_id);}
+// ---------- new run ----------
+let RUNTAB=0;
+function newRun(){
+  $('modalbody').innerHTML=`<b>new run</b>
+    <div class="row" style="margin:8px 0"><button class="tabbtn on" id="tabintent" onclick="runTab(0)">intent (LLM decomposes)</button><button class="tabbtn" id="tabtpl" onclick="runTab(1)">template DAG</button></div>
+    <textarea id="rtext" style="min-height:150px"></textarea>
+    <div class="row" id="examples" style="margin-top:6px">
+      <button onclick="$('rtext').value=this.dataset.v" data-v="tell me about the difference between structured and unstructured pruning of neural networks">tell me about pruning</button>
+      <button onclick="$('rtext').value=this.dataset.v" data-v="write a short research paper on mixture-of-experts routing in transformers, with references">research paper on MoE</button>
+      <button onclick="$('rtext').value=this.dataset.v" data-v="research the main approaches to LLM quantization and write a summary with comparisons">LLM quantization survey</button>
+    </div>
+    <div class="row" style="margin-top:8px"><button onclick="submitRun()">create run</button><button onclick="$('modal').style.display='none'">cancel</button>
+    <span class="chip" id="runhint"></span></div>`;
+  runTab(0); $('modal').style.display='flex';
+}
+function runTab(i){
+  RUNTAB=i; $('tabintent').className='tabbtn'+(i?'':' on'); $('tabtpl').className='tabbtn'+(i?' on':'');
+  $('runhint').textContent=i?'validated on import; runs unaided when tools are auto-approved':'one sentence; the LLM decomposes it into a DAG';
+  $('rtext').value=i?JSON.stringify({nodes:[
+    {id:"w",intent:"write welcome file",tool:"write_file",args:{path:"hello.txt",content:"hi from the harness\n"}},
+    {id:"r",intent:"show the file",tool:"shell",args:{cmd:"cat hello.txt"},deps:["w"]}]},null,2)
+    :'';
+  $('rtext').placeholder=i?'':'describe the goal in one sentence, or click an example below';
+  $('examples').style.display=i?'none':'flex';
+}
+async function submitRun(){
+  const v=$('rtext').value.trim(); if(!v)return;
+  let body;
+  if(RUNTAB===0){ body={intent:v}; }
+  else { try{body=JSON.parse(v);}catch(e){return alert('bad JSON');} }
+  const r=await api('POST','/runs',body);
+  $('modal').style.display='none'; await refreshRuns(); selRun(r.run_id);
+}
 function logLine(e){const t=e.ts?new Date(e.ts*1000).toLocaleTimeString():new Date().toLocaleTimeString();
   const d=document.createElement('div');d.className=e.level||'';d.textContent=`${t} [${e.kind||'-'}] ${e.sender||''}→${e.receiver||''} ${e.msg}`;
   $('log').prepend(d); while($('log').children.length>150)$('log').lastChild.remove();}

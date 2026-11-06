@@ -1,0 +1,53 @@
+
+=== 0. stack health ===
+{"ok":true,"ollama":true,"runs":3,"agents":1}
+=== 1. enable unattended policy (auto_approve shell + write_file) ===
+{
+    "max_depth": 17,
+    "max_nodes": 300,
+    "max_llm_calls": 500,
+    "max_seconds": 7200,
+    "max_repairs": 3,
+    "confirm_actions": true,
+    "auto_approve": [
+        "shell",
+        "write_file"
+    ],
+    "approve_dag_edits": true,
+    "claim_lease_seconds": 120,
+    "heartbeat_seconds": 5,
+    "max_agents": 2
+}
+
+=== 2. import template (examples/add-tests.json) ===
+run_id=1384b13c  (watch it live at http://localhost:8100)
+
+=== 3. agent works the DAG unattended (60s cap) ===
+
+=== 4. final node states ===
+  fix_bug          DONE       attempts=1
+  make_tests_pass  DONE       attempts=1
+  observe_red      DONE       attempts=1
+  seed_repo        DONE       attempts=1
+  write_tests      DONE       attempts=1
+  stats: {'llm_calls': 0, 'execs': 5, 'approvals': 0, 'patches': 0}
+
+=== 5. repo-x on disk (sandbox workspace) ===
+def add(a, b):
+    return a + b
+
+def sub(a, b):
+    return a - b
+
+{"entries":[".pytest_cache/","__pycache__/","calc.py","test_calc.py"]}
+=== 6. metrics snapshot ===
+{
+  "tsr_pct": 75,
+  "avg_latency_ms": 34141,
+  "avg_frt_ms": null,
+  "max_delegation_depth": 0,
+  "first_pass_pct": 100
+}
+
+=== 7. restore confirm-everything policy ===
+done

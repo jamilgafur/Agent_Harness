@@ -52,6 +52,7 @@ class Node(BaseModel):
     hint: str = ""
     parent: str = ""           # set when created by decomposition; parent waits on children
     claimed_at: float = 0.0    # heartbeat of the last claim; stale RUNNING nodes are requeued
+    routed_past: List[str] = []  # agents that redirected this node (paper Alg-2: visited set)
     # loop nodes only: condition is judged each iteration, body is child ids
     condition: str = ""
     max_iterations: int = 10

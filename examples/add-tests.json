@@ -1,0 +1,59 @@
+{
+  "nodes": [
+    {
+      "id": "seed_repo",
+      "intent": "seed repo X with a buggy calculator module",
+      "tool": "write_file",
+      "args": {
+        "path": "repo-x/calc.py",
+        "content": "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return b - a  # BUG: swapped operands\n"
+      }
+    },
+    {
+      "id": "write_tests",
+      "intent": "add tests to repo X covering add and sub",
+      "tool": "write_file",
+      "args": {
+        "path": "repo-x/test_calc.py",
+        "content": "from calc import add, sub\n\ndef test_add():\n    assert add(2, 3) == 5\n\ndef test_sub():\n    assert sub(10, 3) == 7\n"
+      },
+      "deps": [
+        "seed_repo"
+      ]
+    },
+    {
+      "id": "observe_red",
+      "intent": "run the tests and observe the red phase",
+      "tool": "shell",
+      "args": {
+        "cmd": "cd repo-x && python -m pytest -q; true"
+      },
+      "deps": [
+        "write_tests"
+      ]
+    },
+    {
+      "id": "fix_bug",
+      "intent": "fix the swapped operands in calc.sub",
+      "tool": "write_file",
+      "args": {
+        "path": "repo-x/calc.py",
+        "content": "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n"
+      },
+      "deps": [
+        "observe_red"
+      ]
+    },
+    {
+      "id": "make_tests_pass",
+      "intent": "run the test suite to green",
+      "tool": "shell",
+      "args": {
+        "cmd": "cd repo-x && python -m pytest -q"
+      },
+      "deps": [
+        "fix_bug"
+      ]
+    }
+  ]
+}

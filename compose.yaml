@@ -32,6 +32,8 @@ services:
       - workspace:/workspace
     environment:
       WORKSPACE: /workspace
+      SEARX_URL: ${SEARX_URL:-http://host.docker.internal:8095}
+    extra_hosts: ["host.docker.internal:host-gateway"]
 
   agent:
     image: harness:latest
@@ -44,7 +46,6 @@ services:
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       MODEL: ${MODEL:-qwen2.5:3b}
       CORE_URL: http://core:8000
-      AGENT_ID: agent-1
       HARNESS_CONFIG: ${HARNESS_CONFIG:-}
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on: [core]
@@ -65,6 +66,8 @@ services:
       OLLAMA_KEEP_ALIVE: 30m
     deploy:
       resources:
+        limits:
+          memory: 8G # was uncapped — models spill to RAM past the 6GB VRAM budget
         reservations:
           devices:
             - driver: nvidia
