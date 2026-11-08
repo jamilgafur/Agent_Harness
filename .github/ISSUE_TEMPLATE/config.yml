@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/jamilgafur/Agent_Harness/security/advisories/new
+    about: Do NOT open a public issue for vulnerabilities — use private advisories (see SECURITY.md).
+  - name: Question / help
+    url: https://github.com/jamilgafur/Agent_Harness/issues
+    about: "Pick the bug report template and describe what you expected vs what you got — questions with a reproducible setup are the easiest to answer."

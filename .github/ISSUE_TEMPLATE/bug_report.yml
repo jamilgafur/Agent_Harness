@@ -1,0 +1,46 @@
+name: Bug report
+description: Something is broken — a run stuck, a crash, wrong results, a broken build.
+title: "[bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check the [Troubleshooting](https://github.com/jamilgafur/Agent_Harness#troubleshooting) section — wedged ollama runners and stale UIs are the two classics.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The shortest path to the same failure. A run id + `GET /runs/{id}/events`
+        excerpt is often enough; a template-DAG JSON is even better (fully
+        reproducible without any LLM).
+      placeholder: |
+        1. docker compose up -d --build
+        2. POST /runs {"intent": "..."}
+        3. node root.2 goes ESCALATED after 3 repairs
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "docker logs harness-core-1 / harness-agent-1 excerpts, or the event log. Paste, don't screenshot."
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: |
+        - OS / Docker version
+        - MODEL + OLLAMA_URL (e.g. qwen2.5:3b on a local 6GB GPU)
+        - agent count (--scale agent=N)
+        - harness version (git tag/commit)
+    validations:
+      required: true

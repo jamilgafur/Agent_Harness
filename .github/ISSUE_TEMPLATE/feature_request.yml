@@ -1,0 +1,31 @@
+name: Feature request / idea
+description: Something the harness should do (or stop doing).
+title: "[idea]: "
+labels: [enhancement, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [plan.txt](https://github.com/jamilgafur/Agent_Harness/blob/main/plan.txt) and [ROADMAP.md](https://github.com/jamilgafur/Agent_Harness/blob/main/ROADMAP.md) first — several "obvious" ideas are already rejected, with the reasons why. Linking the relevant section helps a lot.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What task are you doing today that this would make possible or easier?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+      description: The behavior, roughly. The maintainer decides the shape — the small-model assumption (deterministic code fixes what the model gets wrong structurally) drives most design decisions here.
+    validations:
+      required: true
+  - type: textarea
+    id: alt
+    attributes:
+      label: Alternatives you considered
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
