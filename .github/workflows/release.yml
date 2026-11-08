@@ -29,7 +29,7 @@ jobs:
             # tag v0.1.0 -> image tag v0.1.0
             type=ref,enable=true,prefix=v
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
