@@ -20,3 +20,4 @@ approve_dag_edits = false                                               # plans 
 claim_lease_seconds = 120   # RUNNING older than this requeues (live-heartbeat agents are exempt)
 heartbeat_seconds = 5
 max_agents = 4              # concurrency gate; run N workers with `docker compose up -d --scale agent=N`
+event_cap = 500             # retained audit events per run (older ones are dropped)

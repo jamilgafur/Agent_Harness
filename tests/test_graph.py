@@ -1,4 +1,4 @@
-from harness.graph import apply_patch, ready_nodes, validate
+from harness.graph import apply_patch, lint, ready_nodes, resolve_args, validate
 from harness.models import Node, NodeState, Patch, PatchOp
 
 TOOLS = ["shell", "write_file"]
@@ -54,3 +54,52 @@ def test_unknown_tool_and_bad_edge():
     assert "unknown tool" in validate({"x": bad}, TOOLS)[0]
     _, errs = apply_patch({}, Patch(ops=[PatchOp(op="add_edge", src="a", dst="b")]), TOOLS)
     assert "unknown endpoint" in errs[0]
+
+
+# ---------- named-parts extraction (document-shape detection) ----------
+def test_named_parts_extracts_named_pieces_only():
+    from harness.graph import named_parts
+    assert named_parts("write a white paper on astrophysics with an abstract, "
+                       "introduction, background, and conclusion") == \
+        ["abstract", "introduction", "background", "conclusion"]
+    assert named_parts("steps: download, parse, summarize") == \
+        ["download", "parse", "summarize"]
+    assert named_parts("fix the parser") == []
+    assert named_parts("tell me about quantization methods for LLMs") == []
+    assert named_parts("compare vLLM and TGI") == []            # no list syntax
+    assert named_parts("write it with at least 3 sources") == []  # single piece
+
+
+# ---------- $from arg bindings (data flow into tool args) ----------
+def test_from_binding_validated_and_resolved():
+    prod = Node(id="mk", intent="create employee", tool="shell", args={"cmd": "mk"},
+                success_predicate="p")
+    use = Node(id="as", intent="assign them", tool="shell", deps=["mk"],
+               args={"cmd": "assign", "who": {"$from": "mk", "path": "employee.id"}},
+               success_predicate="p")
+    nodes = {"mk": prod, "as": use}
+    assert validate(nodes, TOOLS, auto_approve=["shell"]) == []
+    # binding a node that is not a dep loses the ordering guarantee -> rejected
+    bad_dep = use.model_copy(deep=True)
+    bad_dep.deps = []
+    assert any("not in deps" in e for e in validate({"mk": prod, "as": bad_dep}, TOOLS))
+    # binding an unknown node -> rejected
+    unknown = use.model_copy(deep=True)
+    unknown.args = {"cmd": "assign", "who": {"$from": "ghost"}}
+    assert any("unknown node" in e for e in validate({"as": unknown}, TOOLS))
+    # resolution: path digs into the dep's result; missing path is an error
+    prod.state, prod.result = NodeState.DONE, {"employee": {"id": 7}}
+    args, err = resolve_args(nodes, use)
+    assert err == "" and args == {"cmd": "assign", "who": 7}
+    prod.result = {"employee": {}}
+    _, err = resolve_args(nodes, use)
+    assert "not found" in err
+
+
+def test_lint_flags_child_restating_parent():
+    p = Node(id="root", intent="research vLLM tuning in depth")
+    dup = Node(id="root.1", intent="research vLLM tuning in depth", parent="root")
+    real = Node(id="root.2", intent="gather throughput numbers", parent="root")
+    warns = lint({"root": p, "root.1": dup, "root.2": real})
+    assert any("root.1" in w and "restates" in w for w in warns)
+    assert not any("root.2" in w for w in warns)

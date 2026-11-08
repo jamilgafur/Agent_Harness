@@ -151,7 +151,7 @@ def test_heartbeat_registry_and_events_persist(client):
     assert agents["a9"]["alive"] and agents["a9"]["phase"] == "decomposing"
     agents["a9"]["last_seen"] = 0  # stale
     # events survive a simulated restart
-    claim = client.post("/claim", json={"agent_id": "a9"})
+    client.post("/claim", json={"agent_id": "a9"})
     core.RUNS.clear()
     core.RUNS.update(core.store.load_runs())
     events = client.get(f"/runs/{run_id}/events").json()

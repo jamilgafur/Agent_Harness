@@ -8,7 +8,9 @@ services:
     restart: unless-stopped
     labels:
       com.centurylinklabs.watchtower.enable: "false"
-    ports: ["${PORT:-8100}:8000"]
+    # localhost-only: the API has no auth and can mediate code execution —
+    # never bind to a LAN interface
+    ports: ["127.0.0.1:${PORT:-8100}:8000"]
     volumes:
       - data:/data
       - ./harness.toml:/app/harness.toml:ro
@@ -64,6 +66,9 @@ services:
     environment:
       OLLAMA_NUM_CTX: "4096"          # 6GB VRAM budget on this box
       OLLAMA_KEEP_ALIVE: 30m
+      # one slot on this box: cap the wait line so client-abandoned or piled-up
+      # requests fail fast (503) instead of queueing into a runner meltdown
+      OLLAMA_MAX_QUEUE: "8"
     deploy:
       resources:
         limits:

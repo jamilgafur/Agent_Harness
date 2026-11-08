@@ -53,7 +53,7 @@ class FetchReq(BaseModel):
 
 def _confined(p: str) -> Path:
     full = (WORKSPACE / p).resolve()
-    if not str(full).startswith(str(WORKSPACE)):
+    if not full.is_relative_to(WORKSPACE):   # prefix-strings pass ../workspace2- style escapes
         raise HTTPException(400, f"path escapes workspace: {p!r}")
     return full
 
@@ -294,6 +294,9 @@ MCP = _MCPMan()
 
 
 # ---------- dynamic tools (P2): /workspace/tools/*.py → registry entries ----------
+# sync EXECUTES module-level code here in the sandbox container by design (the
+# sandbox is the designated blast radius); the human gate for a newly dropped
+# tool is the "unvetted" approval card core shows on first use.
 class RunToolReq(BaseModel):
     name: str
     args: dict = {}
@@ -316,8 +319,14 @@ def _tool_modules() -> dict:
             meta = getattr(m, "TOOL", None)
             if (isinstance(meta, dict) and "name" in meta
                     and callable(getattr(m, "run", None))):
-                out[meta["name"]] = {"file": f.name, "desc": meta.get("desc", ""),
-                                     "required": list(meta.get("required", []))}
+                ent = {"file": f.name, "desc": meta.get("desc", ""),
+                       "required": list(meta.get("required", []))}
+                # optional: "check" = dotted result path judged deterministically;
+                # "ground" = arg template used when the planner grounds a bare subtask
+                for extra in ("check", "ground"):
+                    if isinstance(meta.get(extra), (str, dict)) and meta.get(extra):
+                        ent[extra] = meta[extra]
+                out[meta["name"]] = ent
     MCP.sync()                   # hot-reload: manifest mtime drives respawn
     for name, t in MCP.tools.items():
         out[name] = {"file": f"mcp:{t['server']}", "desc": t["desc"],

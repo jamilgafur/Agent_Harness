@@ -179,3 +179,106 @@ Ordered by value-per-effort. None block daily use; pick by what the paper/demo n
     deployment if the agent redirects it (stall until `retry_node`). Acceptable today
     (UI retry clears it) — if it bites, age out `routed_past` after N minutes instead
     of clearing it only on user retry.
+
+**DONE 2026-11-06 — domain-generic harness (prompts/params overridable per run)**
+12. `harness/prompts.py` is the single source of truth: DEFAULT_PROMPTS (decompose/
+    synthesize/judge, verbatim) + DEFAULT_PARAMS (model, temperature, child_cap 1-6,
+    gather_tools, sink_tool, max_results 3-10) + resolve_prompt/resolve_params
+    (clamps, blank = default, unknown params → core 400).
+13. Core persists per-run `prompts`/`params` (SQLite columns, migrated), exposes
+    `PUT /runs/{id}/config` (planning-only; 409 after /go), PATCH nodes accepts
+    `args` (required-arg validated), claim payload carries the overrides.
+14. Agent resolves per claim: planner caps at child_cap, names a custom sink_tool
+    (decompose prompt told its name; core accepts it as the virtual writer), binds
+    max_results deterministically, classifies gather/sink per run in
+    _force_synthesis/_deepen_branches/judge; llm.py takes per-call model+temperature.
+    decompose/judge/write default temperature 0.2 (deterministic planner/judge).
+15. UI: ⚙ prompts & parameters editor in the plan bar + per-node ⚙ args editor
+    (planning only); examples/ add a shell-only template DAG + overrides script;
+    README gains "Adapt it". 81 tests green. Live E2E 5fdf4159: child_cap=2 →
+    exactly 2 root children; custom synthesize prompt → head answer bullets-only.
+
+**DONE 2026-11-06 (later) — document-shaped runs: sections + interconnections + knowledge tree**
+16. Prompt-hacking reverted per user: DECOMPOSE_SYS/SYNTH_SYS gutted to ~half (format,
+    grounding, dedup only). Shape logic moved to code: graph.named_parts() detects
+    list-syntax intents ("with an abstract, introduction, background and conclusion"
+    / "steps:" / "sections:") — vocabulary-free. Agent decompose tops up missing
+    named branches; _force_synthesis pins a sink even on all-abstract part trees.
+17. Core wires section writers to earlier sibling branches (depth-1 decompose of a
+    named-parts run) — cross-branch DAG edges, ordering enforced; parallel research
+    branches on unnamed runs stay independent. Planner may also dep any existing
+    node by id (_build_children). Claim context carries `known` (text summaries so
+    far); GET /runs/{id}/knowledge + UI 🌳 knowledge tab expose the tree.
+18. Live E2E d23daf0c (astrophysics white paper): 4 section branches, cross-edges
+    (intro writer <- root.1; background writer <- root.1,root.2; conclusion sink <-
+    all), 9708-char assembled paper at the head, knowledge tree shows summaries
+    rising level by level. 88 tests green.
+19. Head assembly is document-aware: named-parts runs skip the generated preamble
+    (no duplicate of the abstract) and a sink that IS a named part becomes its real
+    section ("## Conclusion", not "Bottom line"). Live E2E f5c8ed7f (black holes
+    paper, 12041 chars): doc opens on the abstract section, sections in order,
+    conclusion consumed abstract+background via cross-edges.
+
+**INCIDENT 2026-11-06 (9ea37d2e stuck) — three-layer root cause, four shipped fixes**
+20. Explosion: the static "shape example" used tool:null children; 3b imitated it recursively
+    (depth-7 abstracts, 73 nodes, 0 DONE). Fix: example is now built from the run's ACTUAL
+    tools in decompose() + "prefer tool children" rule; _force_synthesis grounds
+    abstract-only children into gather leaves at depth >= 2.
+21. Deadlock: the model's "tool":"null" convergence sink became an abstract node WITH deps;
+    planning claimed nothing because claim required DONE deps while plan_ready exempted
+    only tool-gated abstracts. Fixes: _norm_child normalizes null-ish tools FIRST and
+    converts deps-carrying nulls into the sink writer (only writers consume output);
+    planning claim gate is now symmetric — tool deps require DONE, abstract deps are
+    free context. Deleted the exploded run with ?force=1 (plain DELETE 409s while active).
+    98 tests green; root.4 decomposed live; 9ea37d2e plan_ready=True.
+
+22. Audit fixes 2026-11-07 (8 findings): core API now binds 127.0.0.1 (compose ports) —
+    no auth exists; tools synced AFTER startup are "unvetted" → first exec parks a card
+    even when auto_approve names them, approving vets the tool (planted-file bypass shut);
+    sandbox._confined uses Path.is_relative_to (same-prefix sibling escape closed);
+    agent._wait gives up after APPROVAL_TIMEOUT (default 1800s) with rc=-3 so unanswered
+    cards no longer hold an agent forever; models.DEFAULT_POLICY synced to harness.toml
+    and gated by test_shipped_policy_matches_code_defaults (one source of truth);
+    /claim early-exits runs with no PENDING/REPAIRING/RUNNING nodes; duplicate
+    _set("writing") and stale "mailbox" comment removed; junk file at repo root deleted.
+    102 tests green.
+
+23. Correctness + generality round 2026-11-07 (deps downward, info flow, less prompt):
+    tool dep edges on abstract children are PRESERVED through planning (claim gate +
+    plan_ready exemption already handled the 9ea37d2e corner; stripping had been
+    destroying the information edge and contradicting both docs and the gate);
+    _fail_cascade scoped — terminal failure escalates the node and BLOCKs its dep
+    consumers only, parents carry a pointer hint, so fix & retry on the leaf
+    rejoins the branch (recovery hole closed); stale-approval replay shut (exec
+    cards pinned to the claim's attempts epoch + terminal-state block; approvals
+    table +attempts column, ALTER-migrated); stale reports 409 BEFORE spending
+    llm_calls budget; user patches now pass tool_arg_errors like every other path;
+    multi-claim pool removed (claimed-but-unhandled nodes stranded RUNNING until
+    lease expiry — one node per claim, parallelism = --scale agent=N); dead
+    III-B envelope models deleted (wire format is plain REST JSON).
+    Generality: args support {"$from": id, "path": ...} bindings resolved
+    server-side at exec time (validated: binding must ride a declared dep) —
+    data flows into tool args, not only into the writer's material; dynamic tools
+    may declare "check" (dotted result path judged deterministically, no LLM) and
+    "ground" (arg template for grounding bare subtasks — the old gather{"query"}
+    shortcut is gone); named-parts section wiring fires at any depth, not just
+    depth-1 branches; lint() (was uncalled) now flags children restating their
+    parent (jaccard > 0.7) and surfaces via GET /runs/{id}.warnings + plan bar.
+    Less prompt: Ollama structured outputs (JSON schema in `format`) for
+    decompose/judge replies — schema prose left the prompts, INVALID_JSON spam
+    drops; decompose prompt carries only semantic rules.
+    Ops: policy.event_cap (was a constant); per-node llm_calls persisted and shown
+    in the detail panel; GET /runs/{id}/snapshot = save-as-template (UI ⬇ template);
+    README warns that approval args land in SQLite (use $from for secrets).
+    113 tests green.
+
+24. Runner-wedge hardening (2026-11-08): ollama keeps generating after a killed
+    client — aborted probes orphaned generations on the single-slot CPU box until
+    the runner crashed (restart policy recovered it). Defenses: compose
+    OLLAMA_MAX_QUEUE=8 (pile-ups 503 fast); LLM.chat_json bounds replies with
+    num_predict (LLM_JSON_NUM_PREDICT=768, prose unbounded); agents distinguish
+    "runner down" from "node bad" — httpx transport errors / ollama 5xx release
+    the node silently for lease requeue with a backoff (phase llm-down), only
+    spending a FAILED report once attempts are exhausted ("llm unreachable"
+    hint). Ops rule in README: never kill generation clients; wedged -> docker
+    restart harness-ollama-1. 117 tests green.

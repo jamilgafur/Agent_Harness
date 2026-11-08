@@ -248,20 +248,19 @@ def test_budget_governor_decompose(client):
     assert run["nodes"]["root"]["state"] == "ESCALATED" and run["active"] is False
 
 
-def test_claim_parallel_ready_set(client):
-    r = client.post("/runs", json={"nodes": [
+def test_claim_hands_out_one_node_per_call(client):
+    """One node per claim: a claimed-but-unhandled node would sit RUNNING until its
+    lease expired. Parallelism is scaled agents (--scale agent=N), not bulk claims."""
+    client.post("/runs", json={"nodes": [
         {"id": x, "intent": f"task {x}", "tool": "write_file",
          "args": {"path": x, "content": "1"}, "success_predicate": "done"}
         for x in ("a", "b", "c")]})
-    run_id = r.json()["run_id"]
-    claim = client.post("/claim", json={"agent_id": "t", "max_nodes": 2}).json()
-    ids = {n["id"] for n in claim["nodes"]}
-    assert len(ids) == 2 and claim["node"]["id"] in ids     # back-compat "node" = first
-    assert all(n["state"] == "RUNNING" for n in claim["nodes"])
-    claim2 = client.post("/claim", json={"agent_id": "u"}).json()
-    remaining = {"a", "b", "c"} - ids
-    assert claim2["node"]["id"] == remaining.pop()
-    assert client.post("/claim", json={"agent_id": "v"}).json()["node"] is None
+    c1 = client.post("/claim", json={"agent_id": "t"}).json()
+    assert [n["id"] for n in c1["nodes"]] == [c1["node"]["id"]]   # single, "nodes" mirrors
+    c2 = client.post("/claim", json={"agent_id": "u"}).json()
+    c3 = client.post("/claim", json={"agent_id": "v"}).json()
+    assert len({c1["node"]["id"], c2["node"]["id"], c3["node"]["id"]}) == 3
+    assert client.post("/claim", json={"agent_id": "w"}).json()["node"] is None
 
 
 def test_dynamic_tools_sync_and_exec_routing(client, monkeypatch):
@@ -278,8 +277,13 @@ def test_dynamic_tools_sync_and_exec_routing(client, monkeypatch):
         def __init__(self, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
-        async def get(self, url): calls.append((url, None)); return R()
-        async def post(self, url, json=None): calls.append((url, json)); return R()
+        async def get(self, url):
+            calls.append((url, None))
+            return R()
+
+        async def post(self, url, json=None):
+            calls.append((url, json))
+            return R()
 
     monkeypatch.setattr(core.httpx, "AsyncClient", FakeClient)
     # sync pulls sandbox dynamic tools into the registry
@@ -300,6 +304,13 @@ def test_dynamic_tools_sync_and_exec_routing(client, monkeypatch):
     core.POLICY["auto_approve"] = ["shout"]
     run_id = ok.json()["run_id"]
     client.post("/claim", json={"agent_id": "t"})
+    # a tool synced after startup is "unvetted": first use parks a card even with
+    # auto_approve; approving vets it, later calls fly directly
+    res = client.post(f"/runs/{run_id}/exec",
+                      json={"node_id": "s", "tool": "shout", "args": {"text": "hi"}}).json()
+    assert res["status"] == "pending"
+    d = client.post(f"/approvals/{res['exec_id']}", json={"decision": "approve"}).json()
+    assert d["status"] == "done"
     res = client.post(f"/runs/{run_id}/exec",
                       json={"node_id": "s", "tool": "shout", "args": {"text": "hi"}}).json()
     assert res["status"] == "done"
@@ -595,29 +606,364 @@ def test_user_adds_and_edits_branches_during_planning(client):
                         json={"intent": "late"}).status_code == 409
 
 
-def test_result_gated_planner_nodes_are_stripped_and_never_block_the_checkpoint(client):
+def test_result_gated_planner_nodes_keep_deps_and_refine_after_go(client):
+    """The model asks for a result-gated re-plan (abstract child deps'd on a search).
+    The dep edge is PRESERVED — during planning the claim gate holds the node, the
+    checkpoint exempts it, and after /go it refines with the real result in hand."""
     run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
     client.post("/claim", json={"agent_id": "t"})
-    # the model asks for a result-gated re-plan: abstract child deps on a search
     d = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
         {"intent": "read the source", "tool": "web_search",
          "args": {"query": "q", "max_results": 3}, "deps": [], "success_predicate": "hits"},
         {"intent": "break the findings down", "deps": [0], "success_predicate": ""}]})
     assert d.status_code == 200, d.text
     nodes = client.get(f"/runs/{run_id}").json()["nodes"]
-    # during planning the tool dep is stripped: the abstract child is plannable NOW
-    assert nodes["root.2"]["deps"] == [] and nodes["root.2"]["tool"] is None
-    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is False
+    # the information edge survives into the stored graph (the audit trail)
+    assert nodes["root.2"]["deps"] == ["root.1"] and nodes["root.2"]["tool"] is None
+    # gated abstract nodes are exempt from the checkpoint…
+    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is True
+    # …and are NOT claimable during planning (their context arrives with the results)
+    assert client.post("/claim", json={"agent_id": "t2"}).json()["node"] is None
+    client.post(f"/runs/{run_id}/go")
+    # still gated after /go until the search actually returns
+    assert client.post("/claim", json={"agent_id": "t2"}).json()["node"]["id"] == "root.1"
+    client.post(f"/runs/{run_id}/nodes/root.1/result",
+                json={"state": "DONE", "result": {"results": [{"url": "u"}]}})
     c = client.post("/claim", json={"agent_id": "t2"}).json()
     assert c["node"]["id"] == "root.2"
-    # finish its plan and the checkpoint opens
-    assert client.post(f"/runs/{run_id}/nodes/root.2/decompose",
-                       json={"children": [{"intent": "write", "tool": "llm", "deps": [],
-                                           "success_predicate": "answers"}]}
-                       ).status_code == 200
-    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is True
-    # legacy shape (tool-gated abstract node created before the strip): exempt, with
-    # the gated refinement happening after /go — it must not hold the checkpoint
-    core.RUNS[run_id]["nodes"]["root.2"].state = core.NodeState.PENDING
-    core.RUNS[run_id]["nodes"]["root.2"].deps = ["root.1"]
-    assert client.get(f"/runs/{run_id}").json()["plan_ready"] is True
+    assert c["inputs"] == {"root.1": {"results": [{"url": "u"}]}}   # refined with real data
+
+
+# ---------- per-run prompts/params overrides (PUT /config) ----------
+def test_config_roundtrip_clamps_and_persists(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    r = client.put(f"/runs/{run_id}/config",
+                   json={"prompts": {"synthesize": "BRIEF ONLY", "bogus": "dropped"},
+                         "params": {"child_cap": 9, "temperature": 0.9}})
+    assert r.status_code == 200, r.text
+    assert r.json()["prompts"] == {"synthesize": "BRIEF ONLY"}   # unknown prompt key dropped
+    assert r.json()["params"] == {"child_cap": 6, "temperature": 0.9}   # clamped like agents do
+    got = client.get(f"/runs/{run_id}").json()
+    assert got["prompts"] == {"synthesize": "BRIEF ONLY"}
+    assert got["params"]["child_cap"] == 6
+    core.RUNS.clear()                                            # persisted, not process-memory
+    core.RUNS.update(core.store.load_runs())
+    assert client.get(f"/runs/{run_id}").json()["params"]["child_cap"] == 6
+
+
+def test_config_rejects_unknown_params_and_executing_runs(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    assert client.put(f"/runs/{run_id}/config",
+                      json={"params": {"nonsense": 1}}).status_code == 400
+    run_id2 = mk_template_run(client)                            # executing, not planning
+    assert client.put(f"/runs/{run_id2}/config",
+                      json={"params": {"child_cap": 2}}).status_code == 409
+
+
+def test_claim_carries_config_overrides(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.put(f"/runs/{run_id}/config",
+               json={"prompts": {"judge": "BE STRICT"}, "params": {"child_cap": 2}})
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+    client.post(f"/runs/{run_id}/go")
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["prompts"] == {"judge": "BE STRICT"}
+    assert claim["params"].get("child_cap") == 2
+
+
+def test_patch_node_edits_args_and_validates_required_keys(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+    r = client.patch(f"/runs/{run_id}/nodes/root.1", json={"args": {"max_results": 3}})
+    assert r.status_code == 400                                  # web_search still needs query
+    r = client.patch(f"/runs/{run_id}/nodes/root.1",
+                     json={"args": {"query": "new q", "max_results": 9}})
+    assert r.status_code == 200, r.text
+    node = client.get(f"/runs/{run_id}").json()["nodes"]["root.1"]
+    assert node["args"]["query"] == "new q" and node["args"]["max_results"] == 9
+
+
+# ---------- document-shaped runs: section wiring + knowledge tree ----------
+def test_named_parts_wire_section_writers_to_earlier_sections(client):
+    run_id = client.post("/runs", json={
+        "intent": "white paper on dark matter with an abstract, background, "
+                  "and conclusion"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "abstract section", "tool": None, "args": {}, "deps": []},
+        {"intent": "background section", "tool": None, "args": {}, "deps": []},
+        {"intent": "conclusion section", "tool": None, "args": {}, "deps": []},
+        {"intent": "assemble", "tool": "llm", "args": {}, "deps": [0, 1, 2],
+         "success_predicate": "assembled"}]})
+    r = client.post(f"/runs/{run_id}/nodes/root.2/decompose", json={"children": [
+        {"intent": "gather", "tool": "web_search",
+         "args": {"query": "q", "max_results": 3}, "deps": [], "success_predicate": "hits"},
+        {"intent": "write the section", "tool": "llm", "deps": [0],
+         "success_predicate": "written"}]})
+    assert r.status_code == 200, r.text
+    nodes = client.get(f"/runs/{run_id}").json()["nodes"]
+    assert "root.1" in nodes["root.2.2"]["deps"]      # writer consumes the earlier section
+
+    r2 = client.post(f"/runs/{run_id}/nodes/root.3/decompose", json={"children": [
+        {"intent": "write the conclusion", "tool": "llm", "deps": [],
+         "success_predicate": "written"}]})
+    assert r2.status_code == 200, r2.text
+    nodes = client.get(f"/runs/{run_id}").json()["nodes"]
+    assert nodes["root.3.1"]["deps"] == ["root.1", "root.2"]
+
+    r3 = client.post(f"/runs/{run_id}/nodes/root.1/decompose", json={"children": [
+        {"intent": "write the abstract", "tool": "llm", "deps": [],
+         "success_predicate": "written"}]})
+    assert r3.status_code == 200, r3.text
+    assert client.get(f"/runs/{run_id}").json()["nodes"]["root.1.1"]["deps"] == []
+
+
+def test_unnamed_runs_get_no_section_wiring(client):
+    run_id = client.post("/runs", json={"intent": "compare vLLM and TGI"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "branch a", "tool": None, "args": {}, "deps": []},
+        {"intent": "branch b", "tool": None, "args": {}, "deps": []},
+        {"intent": "synthesize", "tool": "llm", "args": {}, "deps": [0, 1],
+         "success_predicate": "done"}]})
+    client.post(f"/runs/{run_id}/nodes/root.2/decompose", json={"children": [
+        {"intent": "write b", "tool": "llm", "deps": [], "success_predicate": "w"}]})
+    nodes = client.get(f"/runs/{run_id}").json()["nodes"]
+    assert nodes["root.2.1"]["deps"] == []            # parallel branches stay independent
+
+
+def test_knowledge_endpoint_nests_text_holders(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+    nodes = core.RUNS[run_id]["nodes"]
+    nodes["root.1"].state = core.NodeState.DONE
+    nodes["root.1"].result = {"text": "branch one summary " * 40}
+    nodes["root.2"].state = core.NodeState.DONE       # done but no text -> pruned
+    k = client.get(f"/runs/{run_id}/knowledge").json()["knowledge"]
+    assert len(k) == 1 and k[0]["id"] == "root" and k[0]["text"] == ""
+    kids = {c["id"]: c for c in k[0]["children"]}
+    assert set(kids) == {"root.1"} and kids["root.1"]["chars"] == len("branch one summary " * 40)
+
+
+def test_claim_context_carries_known_material(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json=_intent_children())
+    client.post(f"/runs/{run_id}/go")
+    nodes = core.RUNS[run_id]["nodes"]
+    nodes["root.1"].state = core.NodeState.DONE
+    nodes["root.1"].result = {"text": "summary of branch one " * 30}
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["node"]["id"] == "root.2"
+    known = {x["id"] for x in claim["context"]["known"]}
+    assert known == {"root.1"}
+
+
+# ---------- agent-generated task guide ----------
+def test_guide_endpoint_is_idempotent_and_visible(client):
+    run_id = client.post("/runs", json={"intent": "x"}).json()["run_id"]
+    r1 = client.post(f"/runs/{run_id}/guide", json={"text": "  sections and evidence  "})
+    assert r1.status_code == 200
+    assert r1.json()["constraints"] == ["guide: sections and evidence"]
+    r2 = client.post(f"/runs/{run_id}/guide", json={"text": "something else"})
+    assert r2.json()["constraints"] == ["guide: sections and evidence"]   # first wins
+    assert client.get(f"/runs/{run_id}").json()["constraints"] == ["guide: sections and evidence"]
+    assert client.post(f"/runs/{run_id}/guide", json={"text": " "}).status_code == 400
+
+
+def test_planning_claims_abstract_node_behind_abstract_deps(client):
+    """9ea37d2e corner: the writer-slot node the model made tool:null is abstract
+    with abstract deps — it must still be claimable in planning."""
+    run_id = client.post("/runs", json={"intent": "learn about x"}).json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "branch a", "tool": None, "args": {}, "deps": []},
+        {"intent": "branch b", "tool": None, "args": {}, "deps": []},
+        {"intent": "branch c", "tool": None, "args": {}, "deps": []},
+        {"intent": "the answer", "tool": None, "args": {}, "deps": [0, 1, 2],
+         "success_predicate": ""}]})
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["node"]["id"] in {"root.1", "root.2", "root.3", "root.4"}
+    got = client.post("/claim", json={"agent_id": "t"}).json()
+    ids = {got["node"]["id"]} if got["node"] else set()
+    assert ids  # keeps handing out abstracts; root.4 is not gated on its abstract deps
+    for nid in ("root.1", "root.2", "root.3"):
+        core.RUNS[run_id]["nodes"][nid].state = core.NodeState.WAITING
+    claim = client.post("/claim", json={"agent_id": "t2"}).json()
+    assert claim["node"]["id"] == "root.4"
+
+
+def test_shipped_policy_matches_code_defaults():
+    """models.DEFAULT_POLICY is the no-toml fallback; any drift from the shipped
+    harness.toml must fail here (one source of truth, enforced)."""
+    import tomllib
+    from pathlib import Path
+
+    from harness.models import DEFAULT_POLICY
+    shipped = tomllib.loads(Path("harness.toml").read_text())["policy"]
+    for k, v in shipped.items():
+        assert DEFAULT_POLICY.get(k) == v, \
+            f"policy drift on {k}: code={DEFAULT_POLICY.get(k)!r} toml={v!r}"
+
+
+def test_escalation_scopes_to_the_branch_and_recovery_rejoins(client):
+    """A leaf failing terminally escalates only ITSELF (plus BLOCKING its dep
+    consumers); the parent keeps working other children with a pointer hint.
+    fix & retry on the leaf reopens the branch and the run completes."""
+    r = client.post("/runs", json={"nodes": [
+        {"id": "root", "intent": "head"},
+        {"id": "root.1", "intent": "gather", "tool": "write_file", "depth": 1,
+         "args": {"path": "f", "content": "c"}, "parent": "root", "success_predicate": "ok"},
+        {"id": "root.2", "intent": "write from f", "tool": "shell", "depth": 1,
+         "args": {"cmd": "cat f"}, "deps": ["root.1"], "parent": "root",
+         "success_predicate": "ok"}]})
+    run_id = r.json()["run_id"]
+    assert r.status_code == 200, r.text
+    for i in range(2):   # max_repairs=2 -> terminal
+        assert client.post("/claim", json={"agent_id": "t"}).json()["node"]["id"] == "root.1"
+        client.post(f"/runs/{run_id}/nodes/root.1/result",
+                    json={"state": "FAILED", "hint": f"boom {i}"})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "ESCALATED"
+    assert run["nodes"]["root.2"]["state"] == "BLOCKED"
+    assert run["nodes"]["root"]["state"] == "PENDING"      # NOT escalated
+    assert "root.1" in run["nodes"]["root"]["hint"]
+    # fix & retry: leaf reopens, the BLOCKED consumer rejoins, run completes
+    client.post(f"/runs/{run_id}/patch",
+                json={"ops": [{"op": "retry_node", "node_id": "root.1"}]})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "PENDING"
+    assert run["nodes"]["root.2"]["state"] == "PENDING"
+    for nid in ("root.1", "root.2"):
+        client.post("/claim", json={"agent_id": "t"})
+        client.post(f"/runs/{run_id}/nodes/{nid}/result", json={"state": "DONE", "result": 1})
+    assert client.get(f"/runs/{run_id}").json()["nodes"]["root"]["state"] == "DONE"
+
+
+def test_stale_report_does_not_spend_llm_budget(client):
+    run_id = mk_template_run(client)
+    client.post("/claim", json={"agent_id": "t"})
+    client.post(f"/runs/{run_id}/nodes/w/result",
+                json={"state": "DONE", "result": 1, "llm_calls": 5})
+    dupe = client.post(f"/runs/{run_id}/nodes/w/result",
+                       json={"state": "DONE", "result": 1, "llm_calls": 5})
+    assert dupe.status_code == 409
+    assert client.get(f"/runs/{run_id}").json()["stats"]["llm_calls"] == 5
+    assert client.get(f"/runs/{run_id}").json()["nodes"]["w"]["llm_calls"] == 5
+
+
+def test_user_patch_validates_required_tool_args(client):
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "x"}]})
+    run_id = r.json()["run_id"]
+    bad = client.post(f"/runs/{run_id}/patch", json={"ops": [
+        {"op": "add_node", "node": {"id": "root.1", "intent": "run it", "tool": "shell",
+                                    "args": {}, "parent": "root", "depth": 1,
+                                    "success_predicate": "p"}}]})
+    assert bad.status_code == 400 and "missing required arg 'cmd'" in str(bad.json())
+
+
+def test_stale_exec_card_does_not_replay(client, monkeypatch):
+    """The agent times out on an unanswered card and the node moves on; approving
+    the late card must not execute the tool again (mutation replay)."""
+    calls = []
+
+    async def fake_exec(tool, args):
+        calls.append(tool)
+        return {"rc": 0}
+
+    monkeypatch.setattr(core, "_exec_tool", fake_exec)
+    run_id = mk_template_run(client)
+    client.post("/claim", json={"agent_id": "t"})
+    ex = client.post(f"/runs/{run_id}/exec", json={
+        "node_id": "w", "tool": "write_file",
+        "args": {"path": "a.txt", "content": "hi"}}).json()
+    assert ex["status"] == "pending"
+    # agent gives up -> FAILED -> REPAIRING; re-claim bumps the attempts epoch
+    client.post(f"/runs/{run_id}/nodes/w/result",
+                json={"state": "FAILED", "hint": "approval unanswered"})
+    client.post("/claim", json={"agent_id": "t"})
+    d = client.post(f"/approvals/{ex['exec_id']}", json={"decision": "approve"}).json()
+    assert d["status"] == "stale" and calls == []
+    # a subsequent card for the CURRENT claim still executes fine
+    ex2 = client.post(f"/runs/{run_id}/exec", json={
+        "node_id": "w", "tool": "write_file",
+        "args": {"path": "a.txt", "content": "hi"}}).json()
+    d2 = client.post(f"/approvals/{ex2['exec_id']}", json={"decision": "approve"}).json()
+    assert d2["status"] == "done" and calls == ["write_file"]
+
+
+def test_exec_resolves_from_bindings(client, monkeypatch):
+    """$from args resolve against dep results server-side before execution."""
+    core.POLICY["auto_approve"] = ["shell"]
+    seen = []
+
+    async def fake_exec(tool, args):
+        seen.append(args)
+        return {"rc": 0}
+
+    monkeypatch.setattr(core, "_exec_tool", fake_exec)
+    r = client.post("/runs", json={"nodes": [
+        {"id": "a", "intent": "create", "tool": "shell",
+         "args": {"cmd": "mk"}, "success_predicate": "p"},
+        {"id": "b", "intent": "assign", "tool": "shell",
+         "args": {"cmd": "assign", "who": {"$from": "a", "path": "employee.id"}},
+         "deps": ["a"], "success_predicate": "p"}]})
+    run_id = r.json()["run_id"]
+    client.post("/claim", json={"agent_id": "t"})
+    client.post(f"/runs/{run_id}/nodes/a/result",
+                json={"state": "DONE", "result": {"employee": {"id": 42}}})
+    client.post("/claim", json={"agent_id": "t"})
+    ex = client.post(f"/runs/{run_id}/exec", json={
+        "node_id": "b", "tool": "shell",
+        "args": {"cmd": "assign", "who": {"$from": "a", "path": "employee.id"}}}).json()
+    assert ex["status"] == "done" and seen[-1]["who"] == 42
+    # unresolvable binding is an error, not a silent null
+    bad = client.post(f"/runs/{run_id}/exec", json={
+        "node_id": "b", "tool": "shell",
+        "args": {"cmd": "assign", "who": {"$from": "a", "path": "employee.nope"}}})
+    assert bad.status_code == 400
+    core.POLICY["auto_approve"] = []
+
+
+def test_snapshot_resets_graph_for_template_reuse(client):
+    run_id = mk_template_run(client)
+    client.post("/claim", json={"agent_id": "t"})
+    client.post(f"/runs/{run_id}/nodes/w/result",
+                json={"state": "DONE", "result": {"bytes": 2}, "llm_calls": 3})
+    snap = client.get(f"/runs/{run_id}/snapshot").json()
+    client.post("/runs", json={"nodes": snap["nodes"]})   # re-importable as a template
+    states = {n["id"]: n["state"] for n in snap["nodes"]}
+    assert set(states.values()) == {"PENDING"}
+    assert all(n["result"] is None and n["attempts"] == 0 and n["llm_calls"] == 0
+               for n in snap["nodes"])
+
+
+def test_run_warnings_flag_restatement(client):
+    run_id = client.post("/runs", json={"intent": "research vLLM tuning in depth"}) \
+        .json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "gather tuning levers", "tool": "web_search",
+         "args": {"query": "q", "max_results": 3}, "deps": [], "success_predicate": "h"},
+        {"intent": "research vLLM tuning in depth", "tool": None, "deps": []}]})
+    got = client.get(f"/runs/{run_id}").json()
+    assert any("restates" in w for w in got["warnings"])   # lint is surfaced, not silent
+
+
+def test_dynamic_tool_synced_after_startup_shows_card_once(client, monkeypatch):
+    """Audit fix: a dropped+synced tool is "unvetted" — auto_approve cannot fly
+    it silently; the first exec parks a card, approving it vets the tool."""
+    core.POLICY["auto_approve"] = ["planted"]
+    core.TOOLS["planted"] = {"desc": "", "required": [], "dynamic": True, "unvetted": True}
+    run_id = client.post("/runs", json={"intent": "t"}).json()["run_id"]
+    try:
+        ex = client.post(f"/runs/{run_id}/exec",
+                         json={"node_id": "root", "tool": "planted", "args": {}}).json()
+        assert ex["status"] == "pending"          # card despite auto_approve
+        async def fake_exec(tool, args):
+            return {"rc": 0, "text": "ok"}
+        monkeypatch.setattr(core, "_exec_tool", fake_exec)
+        d = client.post(f"/approvals/{ex['exec_id']}",
+                        json={"decision": "approve"}).json()
+        assert d["status"] == "done"
+        assert not core.TOOLS["planted"].get("unvetted")      # vetted by the human card
+        ex2 = client.post(f"/runs/{run_id}/exec",
+                          json={"node_id": "root", "tool": "planted", "args": {}}).json()
+        assert ex2["status"] == "done"                        # auto_approve now applies
+    finally:
+        core.POLICY["auto_approve"] = []

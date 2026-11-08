@@ -1,0 +1,45 @@
+{
+  "intent": "inventory the codebase in the sandbox workspace and write a report",
+  "nodes": [
+    {
+      "id": "inv.1",
+      "intent": "list python files in the workspace",
+      "tool": "shell",
+      "args": {"cmd": "find . -name '*.py' | head -50"},
+      "success_predicate": "outputs a list of .py paths (possibly empty)"
+    },
+    {
+      "id": "inv.2",
+      "intent": "count total lines of python code",
+      "tool": "shell",
+      "args": {"cmd": "wc -l $(find . -name '*.py') | tail -1"},
+      "success_predicate": "outputs one total line count"
+    },
+    {
+      "id": "inv.3",
+      "intent": "show the top-level workspace layout",
+      "tool": "shell",
+      "args": {"cmd": "ls"},
+      "success_predicate": "outputs the top-level entries of the workspace"
+    },
+    {
+      "id": "inv.write",
+      "intent": "collect the gathered data into an outline file",
+      "tool": "write_file",
+      "args": {
+        "path": "inventory/report.md",
+        "content": "# Codebase Inventory\n\n## Files (sample)\n(paste find output here)\n\n## Line count\n(paste wc output here)\n\n## Layout\n(paste ls output here)\n"
+      },
+      "deps": ["inv.1", "inv.2", "inv.3"],
+      "success_predicate": "inventory/report.md exists containing the gathered outline"
+    },
+    {
+      "id": "inv.synth",
+      "intent": "write the inventory summary from the gathered data",
+      "tool": "llm",
+      "args": {},
+      "deps": ["inv.1", "inv.2", "inv.3", "inv.write"],
+      "success_predicate": "summarizes the inventory using the gathered material"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 """Config: harness.toml if a TOML parser exists, env vars otherwise (env wins)."""
 import json
 import os
-from typing import Any, Dict
+from typing import Any
 
 try:
     import tomllib  # py3.11+
@@ -10,7 +10,7 @@ except ImportError:  # py3.9/3.10 fallback for local dev; containers are py3.12
 
 from .models import DEFAULT_POLICY
 
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "ollama_url": "http://localhost:11434",
     "model": "qwen2.5:7b",
     "core_url": "http://core:8000",
@@ -21,7 +21,7 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
-def load(path: str = "harness.toml") -> Dict[str, Any]:
+def load(path: str = "harness.toml") -> dict[str, Any]:
     cfg = dict(DEFAULTS)
     cfg["policy"] = dict(DEFAULT_POLICY)
     if tomllib and os.path.exists(path):

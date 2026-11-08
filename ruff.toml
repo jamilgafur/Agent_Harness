@@ -1,0 +1,9 @@
+line-length = 110
+target-version = "py312"
+
+[lint]
+# E/F: errors+pyflakes, I: imports, UP: pyupgrade. Deliberately off: BLE/S/TRY —
+# the sandbox and core intentionally degrade tool failures, they are not security gates.
+select = ["E", "F", "I", "UP"]
+# UP042: (str, Enum) is a deliberate pydantic/v2-safe pattern here; .value is used uniformly.
+ignore = ["UP042"]

@@ -1,6 +1,7 @@
 """Sandbox web tools: HTML scraping and text extraction are pure functions."""
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -109,7 +110,7 @@ def test_mcp_discover_call_and_hot_reload(mcp_client):
     c, man, tmp = mcp_client
     manifest = {"servers": {"hello": {"command": [sys.executable, str(EXAMPLE_MCP)]}}}
     (tmp / "mcp.json").write_text(json.dumps(manifest))
-    import time as _t; _t.sleep(1.05)  # mtime granularity on some filesystems
+    time.sleep(1.05)  # mtime granularity on some filesystems
     tools = c.get("/discover_tools").json()["tools"]
     assert tools["mcp_hello_greet"]["required"] == ["name"]
     ok = c.post("/run_tool", json={"name": "mcp_hello_greet",
@@ -125,9 +126,9 @@ def test_mcp_broken_manifest_keeps_good_servers(mcp_client):
     c, man, tmp = mcp_client
     manifest = {"servers": {"hello": {"command": [sys.executable, str(EXAMPLE_MCP)]}}}
     (tmp / "mcp.json").write_text(json.dumps(manifest))
-    import time as _t; _t.sleep(1.05)
+    time.sleep(1.05)
     assert "mcp_hello_greet" in c.get("/discover_tools").json()["tools"]
-    import time as _t2; _t2.sleep(1.05)
+    time.sleep(1.05)
     (tmp / "mcp.json").write_text("{ not json")
     # broken manifest: current tool set keeps working
     ok = c.post("/run_tool", json={"name": "mcp_hello_greet",
@@ -157,3 +158,16 @@ def test_dynamic_tool_discover_and_run(monkeypatch, tmp_path):
     assert missing["rc"] == -6 and "missing required args" in missing["stderr"]
     r = c.post("/run_tool", json={"name": "nope", "args": {}})
     assert r.status_code == 404
+
+
+def test_confined_rejects_same_prefix_sibling_escape(tmp_path, monkeypatch):
+    """../workspace_evil/x resolved outside WORKSPACE but passed the old
+    startswith("/workspace") check (path-prefix bug)."""
+    from fastapi import HTTPException
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "ws_evil").mkdir()
+    monkeypatch.setattr(sb, "WORKSPACE", ws)
+    with pytest.raises(HTTPException):
+        sb._confined("../ws_evil/x.txt")
+    assert sb._confined("sub/../x.txt") == ws / "x.txt"

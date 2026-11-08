@@ -13,48 +13,74 @@ Approvals gate the UI, they are NOT an auth boundary: bind to localhost in compo
 anything untrusted shares the LAN. Single process; asyncio.Lock makes mutations atomic."""
 import asyncio
 import json
-import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 
 from .config import load
-from .graph import apply_patch, descendants, ready_nodes, validate
-from .models import Patch, Node, NodeState, NodeType
+from .graph import (
+    apply_patch,
+    descendants,
+    lint,
+    named_parts,
+    ready_nodes,
+    resolve_args,
+    validate,
+)
+from .models import (
+    AddedNode,
+    ChildIn,
+    ClaimIn,
+    ConfigIn,
+    ConstraintIn,
+    DecisionIn,
+    DecomposeIn,
+    ExecIn,
+    GuideIn,
+    HeartbeatIn,
+    Node,
+    NodeState,
+    NodeType,
+    NodeUpdate,
+    Patch,
+    RedirectIn,
+    ResultIn,
+    RunIn,
+)
+from .prompts import DEFAULT_PARAMS, PROMPT_KEYS, resolve_params
+from .store import Store
 
 CFG = load()
-POLICY: Dict[str, Any] = CFG["policy"]
-TOOLS: Dict[str, Dict[str, Any]] = {
+POLICY: dict[str, Any] = CFG["policy"]
+TOOLS: dict[str, dict[str, Any]] = {
     "shell": {"desc": "run a shell command in the shared sandbox workspace",
               "required": ["cmd"]},
     "read_file": {"desc": "read a file from the workspace", "required": ["path"]},
     "write_file": {"desc": "write a file in the workspace", "required": ["path", "content"]},
     "list_dir": {"desc": "list a directory in the workspace", "required": ["path"]},
     "web_search": {"desc": "search the web (SearXNG); returns [{title,url,snippet}]",
-                   "required": ["query"]},
+                   "required": ["query"], "ground": {"query": "{intent}"}},
     "http_fetch": {"desc": "fetch a URL and return readable text",
                    "required": ["url"]},
     "llm": {"desc": "virtual (agent-side): the LLM writes an answer using its deps' "
                     "results as material; returns {text}. No args.",
             "required": []},
 }
-EVENT_CAP = 500          # per run; research tool, not Splunk
 AGENT_STALE_S = 15       # heartbeat older than this -> agent shown dead
 DB = Path(CFG["data_dir"]) / "harness.db"
 app = FastAPI(title="harness-core")
 _lock = asyncio.Lock()
-_ws: List[WebSocket] = []
+_ws: list[WebSocket] = []
 # agent_id -> liveness/position/phase; in-memory on purpose (dead agents die with core)
-AGENTS: Dict[str, Dict[str, Any]] = {}
+AGENTS: dict[str, dict[str, Any]] = {}
 
 
-def tool_arg_errors(nodes: Dict[str, Node]) -> List[str]:
+def tool_arg_errors(nodes: dict[str, Node]) -> list[str]:
     """Args schema check: small local models invent arg names; this turns it into
     a validation error they can repair."""
     return [f"{n.id}: tool {n.tool!r} missing required arg {k!r}"
@@ -63,114 +89,17 @@ def tool_arg_errors(nodes: Dict[str, Node]) -> List[str]:
             for k in TOOLS[n.tool]["required"] if k not in n.args]
 
 
-# ---------- store: JSON snapshots + events/mailbox log ----------
-class Store:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.executescript(
-            "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, created REAL, intent TEXT,"
-            "  nodes TEXT, stats TEXT);"
-            "CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, run_id TEXT, node_id TEXT,"
-            "  tool TEXT, args TEXT, status TEXT, result TEXT, created REAL);"
-            "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "  run_id TEXT, ts REAL, level TEXT, kind TEXT, sender TEXT, receiver TEXT,"
-            "  msg TEXT, payload TEXT);"
-        )
-        try:  # migration for DBs created before approval kinds existed
-            self.db.execute("ALTER TABLE approvals ADD COLUMN kind TEXT DEFAULT 'exec'")
-        except sqlite3.OperationalError:
-            pass
-        for col, ddl in (("phase", "ALTER TABLE runs ADD COLUMN phase TEXT DEFAULT 'executing'"),
-                         ("constraints", "ALTER TABLE runs ADD COLUMN constraints TEXT DEFAULT '[]'")):
-            try:  # migration for DBs created before the plan-checkpoint fields
-                self.db.execute(ddl)
-            except sqlite3.OperationalError:
-                pass
-        self.db.commit()
-
-    def save_run(self, run: Dict[str, Any]) -> None:
-        self.db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?)",
-                        (run["id"], run["created"], run["intent"],
-                         json.dumps({k: v.model_dump() for k, v in run["nodes"].items()}),
-                         json.dumps(run["stats"]),
-                         run.get("phase", "executing"),
-                         json.dumps(run.get("constraints", []))))
-        self.db.commit()
-
-    def load_runs(self) -> Dict[str, Dict[str, Any]]:
-        out = {}
-        for rid, created, intent, nodes, stats, phase, cons in self.db.execute("SELECT * FROM runs"):
-            out[rid] = {"id": rid, "created": created, "intent": intent,
-                        "phase": phase or "executing", "constraints": json.loads(cons or "[]"),
-                        "nodes": {k: Node(**v) for k, v in json.loads(nodes).items()},
-                        "stats": json.loads(stats)}
-        return out
-
-    def delete_run(self, rid: str) -> None:
-        self.db.execute("DELETE FROM runs WHERE id=?", (rid,))
-        self.db.execute("DELETE FROM approvals WHERE run_id=?", (rid,))
-        self.db.execute("DELETE FROM events WHERE run_id=?", (rid,))
-        self.db.commit()
-
-    def log(self, run_id: str, level: str, kind: str, sender: str, receiver: str,
-            msg: str, payload: Any = None) -> Dict[str, Any]:
-        cur = self.db.execute(
-            "INSERT INTO events (run_id, ts, level, kind, sender, receiver, msg, payload)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, time.time(), level, kind, sender, receiver, msg,
-             json.dumps(payload, default=str)))
-        self.db.execute(  # retention cap
-            "DELETE FROM events WHERE run_id=? AND id NOT IN"
-            " (SELECT id FROM events WHERE run_id=? ORDER BY id DESC LIMIT ?)",
-            (run_id, run_id, EVENT_CAP))
-        self.db.commit()
-        return {"id": cur.lastrowid, "run_id": run_id, "ts": time.time(), "level": level,
-                "kind": kind, "sender": sender, "receiver": receiver, "msg": msg,
-                "payload": payload}
-
-    def events(self, run_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
-        return [{"id": r[0], "run_id": r[1], "ts": r[2], "level": r[3], "kind": r[4],
-                 "sender": r[5], "receiver": r[6], "msg": r[7],
-                 "payload": json.loads(r[8])} for r in self.db.execute(
-                    "SELECT * FROM events WHERE run_id=? AND id>? ORDER BY id",
-                    (run_id, after_id))]
-
-    def save_approval(self, a: Dict[str, Any]) -> None:
-        self.db.execute("INSERT OR REPLACE INTO approvals VALUES (?,?,?,?,?,?,?,?,?)",
-                        (a["id"], a["run_id"], a["node_id"], a.get("tool", ""),
-                         json.dumps(a["args"]), a["status"],
-                         json.dumps(a.get("result")), a["created"], a.get("kind", "exec")))
-        self.db.commit()
-
-    def approvals(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        q, args = "SELECT * FROM approvals ORDER BY created DESC", ()
-        if status:
-            q, args = "SELECT * FROM approvals WHERE status=? ORDER BY created DESC", (status,)
-        return [self._ap(r) for r in self.db.execute(q, args)]
-
-    def approval(self, aid: str) -> Optional[Dict[str, Any]]:
-        row = self.db.execute("SELECT * FROM approvals WHERE id=?", (aid,)).fetchone()
-        return self._ap(row) if row else None
-
-    @staticmethod
-    def _ap(r) -> Dict[str, Any]:
-        return {"id": r[0], "run_id": r[1], "node_id": r[2], "tool": r[3],
-                "args": json.loads(r[4]), "status": r[5], "result": json.loads(r[6]),
-                "created": r[7], "kind": r[8] if len(r) > 8 else "exec"}
-
-
-store = Store(DB)
-RUNS: Dict[str, Dict[str, Any]] = store.load_runs()
+store = Store(DB, event_cap=POLICY.get("event_cap", 500))
+RUNS: dict[str, dict[str, Any]] = store.load_runs()
 
 
 # ---------- helpers ----------
-def _active(run: Dict[str, Any]) -> bool:
+def _active(run: dict[str, Any]) -> bool:
     return any(n.state in (NodeState.PENDING, NodeState.RUNNING, NodeState.REPAIRING,
                            NodeState.WAITING) for n in run["nodes"].values())
 
 
-def _ancestors(run: Dict[str, Any], nid: str) -> set:
+def _ancestors(run: dict[str, Any], nid: str) -> set:
     out, stack = set(), list(run["nodes"][nid].deps)
     while stack:
         cur = stack.pop()
@@ -180,7 +109,7 @@ def _ancestors(run: Dict[str, Any], nid: str) -> set:
     return out
 
 
-def _subtree(run: Dict[str, Any], nid: str) -> List[str]:
+def _subtree(run: dict[str, Any], nid: str) -> list[str]:
     """nid plus every node below it via PARENT links (decomposition tree),
     which is the relation replan deletes along — dep edges ignore parents."""
     out, frontier = [], [nid]
@@ -192,7 +121,7 @@ def _subtree(run: Dict[str, Any], nid: str) -> List[str]:
     return out
 
 
-def _plan_ready(run: Dict[str, Any]) -> bool:
+def _plan_ready(run: dict[str, Any]) -> bool:
     """Planning checkpoint reached: every abstract node plannable NOW has been
     decomposed down to atomic tool leaves. Abstract nodes gated behind not-yet-run
     tool deps can't be worked during planning (their context arrives with the
@@ -214,7 +143,7 @@ def _pending_approvals(run_id: str) -> set:
     return {a["node_id"] for a in store.approvals("pending") if a["run_id"] == run_id}
 
 
-async def _broadcast(msg: Dict[str, Any]) -> None:
+async def _broadcast(msg: dict[str, Any]) -> None:
     dead = []
     for ws in _ws:
         try:
@@ -238,12 +167,18 @@ async def _state(run_id: str) -> None:
                       "stats": run["stats"], "active": _active(run),
                       "phase": run.get("phase", "executing"),
                       "constraints": run.get("constraints", []),
+                      "prompts": run.get("prompts", {}),
+                      "params": run.get("params", {}),
                       "plan_ready": _plan_ready(run),
+                      "warnings": lint(run["nodes"]),
                       "pending": sorted(_pending_approvals(run_id))})
 
 
-def _fail_cascade(run: Dict[str, Any], nid: str, hint: str, state: NodeState) -> None:
-    """Terminal failure: node -> state, descendants -> BLOCKED, parent inherits."""
+def _fail_cascade(run: dict[str, Any], nid: str, hint: str, state: NodeState) -> None:
+    """Terminal failure of ONE node: it -> state, its dep-consumers -> BLOCKED.
+    Parents are NOT escalated (a leaf going purple must not sink the whole run);
+    the parent just carries a pointer hint, so fix & retry on the failing leaf
+    reopens the branch — patch_run lifts BLOCKED nodes whose ancestors cleared."""
     node = run["nodes"][nid]
     node.state, node.hint = state, hint
     for d in descendants(run["nodes"], nid):
@@ -254,10 +189,10 @@ def _fail_cascade(run: Dict[str, Any], nid: str, hint: str, state: NodeState) ->
     if node.parent and node.parent in run["nodes"]:
         p = run["nodes"][node.parent]
         if p.state != NodeState.DONE:
-            _fail_cascade(run, node.parent, f"child {nid} {state.value.lower()}: {hint}", state)
+            p.hint = f"child {nid} {state.value.lower()}: {hint}"[:300]
 
 
-def _settle(run: Dict[str, Any], nid: str) -> None:
+def _settle(run: dict[str, Any], nid: str) -> None:
     """After DONE: complete parents whose children are all DONE (bottom-up).
     The parent takes its writer child's text (the sink = most deps), so the train
     of thought climbs: raw results stay on leaves, summaries rise level by level,
@@ -276,7 +211,7 @@ def _settle(run: Dict[str, Any], nid: str) -> None:
             _settle(run, p.id)
 
 
-async def _exec_tool(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+async def _exec_tool(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     """Core mediates every tool call to the sandbox. Static tools have fixed
     endpoints; anything else is a dynamic tool from /workspace/tools (P2)."""
     if tool == "llm":   # virtual, agent-side only — never sandboxed
@@ -297,7 +232,7 @@ async def _exec_tool(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"rc": -4, "stdout": "", "stderr": f"sandbox unreachable: {type(e).__name__}"}
 
 
-def _budget_breach(run: Dict[str, Any]) -> str:
+def _budget_breach(run: dict[str, Any]) -> str:
     """Budget governor: returns a reason when the run exceeded its budgets."""
     if run["stats"]["llm_calls"] >= POLICY["max_llm_calls"]:
         return f"max_llm_calls={POLICY['max_llm_calls']} reached"
@@ -306,7 +241,7 @@ def _budget_breach(run: Dict[str, Any]) -> str:
     return ""
 
 
-def _terminate(run: Dict[str, Any], reason: str) -> None:
+def _terminate(run: dict[str, Any], reason: str) -> None:
     """Governor stop: every live node ESCALATED -> run leaves the claimable set."""
     for n in run["nodes"].values():
         if n.state in (NodeState.PENDING, NodeState.RUNNING, NodeState.REPAIRING,
@@ -315,7 +250,7 @@ def _terminate(run: Dict[str, Any], reason: str) -> None:
             n.claimed_at = 0.0
 
 
-def _requeue_stale(run: Dict[str, Any]) -> None:
+def _requeue_stale(run: dict[str, Any]) -> None:
     """Lease sweep: RUNNING nodes past the lease (no pending approval) go back to PENDING."""
     lease = POLICY["claim_lease_seconds"]
     pend = _pending_approvals(run["id"])
@@ -328,62 +263,14 @@ def _requeue_stale(run: Dict[str, Any]) -> None:
                       f"{n.id}: lease expired, requeued")
 
 
-# ---------- request bodies ----------
-class RunIn(BaseModel):
-    intent: str = ""
-    nodes: List[Node] = []
+def _known_tools(run: dict[str, Any]) -> dict[str, Any]:
+    """TOOLS plus the run's custom synthesis sink name (per-run virtual writer)."""
+    sink = resolve_params(run.get("params"))["sink_tool"]
+    return TOOLS if sink in TOOLS else {**TOOLS, sink: TOOLS["llm"]}
 
 
-class ClaimIn(BaseModel):
-    agent_id: str
-    max_nodes: int = 1     # parallel ready-set: claim up to this many leaves at once
-
-
-class ResultIn(BaseModel):
-    state: str               # DONE | FAILED
-    result: Optional[Any] = None
-    hint: str = ""
-    llm_calls: int = 0
-    agent_id: str = ""
-
-
-class ChildIn(BaseModel):
-    intent: str
-    tool: Optional[str] = None
-    args: Dict[str, Any] = {}
-    deps: List[Any] = []    # sibling indices (agent) or sibling ids (approval round-trip)
-    success_predicate: str = ""
-
-
-class DecomposeIn(BaseModel):
-    children: List[ChildIn]
-
-
-class RedirectIn(BaseModel):
-    agent_id: str
-    reason: str = ""
-
-
-class ExecIn(BaseModel):
-    node_id: str
-    tool: str
-    args: Dict[str, Any] = {}
-
-
-class DecisionIn(BaseModel):
-    decision: str            # approve | reject
-    args: Optional[Dict[str, Any]] = None   # exec: edited args; patch: {"children": [...]}
-
-
-class HeartbeatIn(BaseModel):
-    agent_id: str
-    run_id: str = ""
-    node_id: str = ""
-    phase: str = "idle"
-
-
-def _build_children(nodes: Dict[str, Node], nid: str,
-                    raw: List[Dict[str, Any]]) -> Tuple[List[Node], List[str]]:
+def _build_children(nodes: dict[str, Node], nid: str,
+                    raw: list[dict[str, Any]]) -> tuple[list[Node], list[str]]:
     """Validate + instantiate decomposition children. Errors here feed the LLM repair loop."""
     if nid not in nodes:
         return [], [f"unknown node {nid!r}"]
@@ -396,18 +283,20 @@ def _build_children(nodes: Dict[str, Node], nid: str,
         parsed = [ChildIn(**c) for c in raw]
     except Exception as e:
         return [], [f"child schema error: {e}"]
-    errors: List[str] = []
-    children: List[Node] = []
+    errors: list[str] = []
+    children: list[Node] = []
     for i, ch in enumerate(parsed):
-        resolved: List[str] = []
+        resolved: list[str] = []
         for j in ch.deps:
             if isinstance(j, int):
                 if not 0 <= j < i:
                     errors.append(f"child {i}: dep index {j} must point to an earlier sibling")
                 else:
                     resolved.append(f"{nid}.{j + 1}")
-            elif isinstance(j, str) and any(c.id == j for c in children):
-                resolved.append(j)          # parked approval form: already-resolved id
+            elif isinstance(j, str) and (any(c.id == j for c in children) or j in nodes):
+                resolved.append(j)          # batch sibling or an existing run node
+        # (cross-branch edge: e.g. a conclusion section consumes another branch —
+        # the target already exists, so no cycle can route through the new child)
             else:
                 errors.append(f"child {i}: dep {j!r} must be an earlier sibling index or id")
         # small models write "tool": "null" (string) — treat null-ish as abstract
@@ -420,22 +309,40 @@ def _build_children(nodes: Dict[str, Node], nid: str,
     return ([] if errors else children), errors
 
 
-def _apply_decompose(run: Dict[str, Any], nid: str, children: List[Node]) -> List[str]:
+def _idx(nid: str) -> int:
+    """Creation order within a parent: root.2 < root.10 (numeric tail, not string)."""
+    try:
+        return int(nid.rsplit(".", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _apply_decompose(run: dict[str, Any], nid: str, children: list[Node]) -> list[str]:
     """Validate as a patch and apply; parent -> WAITING. Caller holds the lock."""
-    if run.get("phase") == "planning":
-        # plan-first: an abstract child must be plannable NOW, from neighbor
-        # context — result-gated planning (deps on tools) waits for /go,
-        # so strip tool deps off abstract children
-        for c in children:
-            if c.tool:
-                continue
-            c.deps = [d for d in c.deps
-                      if not next((x.tool for x in children if x.id == d),
-                                  run["nodes"].get(d) and run["nodes"][d].tool)]
+    parent = run["nodes"].get(nid)
+    if parent is not None and parent.parent in run["nodes"]:
+        # document-shaped runs (the intent names its pieces) wire their sections:
+        # a branch's writer consumes the EARLIER sections' summaries, so it writes
+        # with the previous part in hand and sections cannot race each other —
+        # section branches sit at any depth (part -> chapter -> section)
+        parts = named_parts(run.get("intent") or "")
+        if parts:
+            sink_name = resolve_params(run.get("params"))["sink_tool"]
+            earlier = [s for s in run["nodes"].values()
+                       if s.parent == parent.parent and s.id != nid
+                       and _idx(s.id) < _idx(nid)]
+            for c in children:
+                if c.tool == sink_name:
+                    c.deps += [s.id for s in earlier if s.id not in c.deps]
+    # Tool-gated abstract children KEEP their tool deps: during planning the claim
+    # gate holds them (they refine with real results after /go), and _plan_ready
+    # exempts them from the checkpoint. Stripping them here would delete the
+    # information edge from the stored graph — the audit trail must not lie.
     patch = Patch(ops=[{"op": "add_node", "node": c.model_dump()} for c in children],
                   reason=f"decompose {nid}")
-    new_nodes, errs = apply_patch(run["nodes"], patch, TOOLS, POLICY["max_depth"],
-                                  POLICY["max_nodes"], POLICY["auto_approve"])
+    new_nodes, errs = apply_patch(run["nodes"], patch, _known_tools(run),
+                                  POLICY["max_depth"], POLICY["max_nodes"],
+                                  POLICY["auto_approve"])
     if errs:
         return errs
     new_nodes[nid].state = NodeState.WAITING
@@ -445,14 +352,14 @@ def _apply_decompose(run: Dict[str, Any], nid: str, children: List[Node]) -> Lis
     return []
 
 
-def _agents_public() -> Dict[str, Any]:
+def _agents_public() -> dict[str, Any]:
     now = time.time()
     return {aid: {**a, "age": round(now - a["last_seen"], 1),
                   "alive": now - a["last_seen"] < AGENT_STALE_S}
             for aid, a in AGENTS.items()}
 # ---------- endpoints: infra ----------
 @app.get("/health")
-async def health() -> Dict[str, Any]:
+async def health() -> dict[str, Any]:
     ollama_ok = False
     try:
         async with httpx.AsyncClient(timeout=3) as c:
@@ -463,12 +370,12 @@ async def health() -> Dict[str, Any]:
 
 
 @app.get("/tools")
-def tools() -> Dict[str, Any]:
+def tools() -> dict[str, Any]:
     return {"tools": TOOLS, "auto_approve": POLICY["auto_approve"]}
 
 
 @app.post("/tools/sync")
-async def tools_sync() -> Dict[str, Any]:
+async def tools_sync() -> dict[str, Any]:
     """Pull dynamic tools (P2) from the sandbox into the registry. Repeatable:
     re-sync after dropping or editing a .py in /workspace/tools."""
     try:
@@ -481,18 +388,23 @@ async def tools_sync() -> Dict[str, Any]:
     for name in [k for k, v in TOOLS.items() if v.get("dynamic") and k not in found]:
         del TOOLS[name]                # hot-reload removes vanished tools too
     for name, meta in found.items():
-        TOOLS[name] = {"desc": meta.get("desc", f"dynamic tool ({meta.get('file')})"),
-                       "required": meta.get("required", []), "dynamic": True}
+        ent = {"desc": meta.get("desc", f"dynamic tool ({meta.get('file')})"),
+               "required": meta.get("required", []), "dynamic": True,
+               "unvetted": name not in TOOLS}   # new since startup: first use shows a card
+        for extra in ("check", "ground"):
+            if meta.get(extra):
+                ent[extra] = meta[extra]
+        TOOLS[name] = ent
     return {"synced": sorted(found), "tools": TOOLS}
 
 
 @app.get("/policy")
-def get_policy() -> Dict[str, Any]:
+def get_policy() -> dict[str, Any]:
     return POLICY
 
 
 @app.get("/autosize")
-async def autosize() -> Dict[str, Any]:
+async def autosize() -> dict[str, Any]:
     """Autosizer (P3): suggest max_agents from measured LLM latency.
     shortcut: fixed latency bands; a real autosizer also watches queue depth
     and VRAM — upgrade if the mesh ever shares the GPU with other services."""
@@ -510,7 +422,7 @@ async def autosize() -> Dict[str, Any]:
 
 
 @app.post("/policy")
-async def set_policy(body: Dict[str, Any]) -> Dict[str, Any]:
+async def set_policy(body: dict[str, Any]) -> dict[str, Any]:
     allowed = {"max_agents", "approve_dag_edits", "claim_lease_seconds",
                "confirm_actions", "auto_approve"}
     unknown = set(body) - allowed
@@ -522,7 +434,7 @@ async def set_policy(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.post("/heartbeat")
-async def heartbeat(hb: HeartbeatIn) -> Dict[str, Any]:
+async def heartbeat(hb: HeartbeatIn) -> dict[str, Any]:
     AGENTS[hb.agent_id] = {"last_seen": time.time(), "run_id": hb.run_id,
                            "node_id": hb.node_id, "phase": hb.phase}
     await _broadcast({"type": "agents", "agents": _agents_public()})
@@ -530,13 +442,13 @@ async def heartbeat(hb: HeartbeatIn) -> Dict[str, Any]:
 
 
 @app.get("/agents")
-def list_agents() -> Dict[str, Any]:
+def list_agents() -> dict[str, Any]:
     return _agents_public()
 
 
 # ---------- endpoints: runs ----------
 @app.post("/runs")
-async def create_run(body: RunIn) -> Dict[str, Any]:
+async def create_run(body: RunIn) -> dict[str, Any]:
     if body.nodes:
         nodes = {n.id: n for n in body.nodes}
         if len(nodes) != len(body.nodes):
@@ -555,6 +467,7 @@ async def create_run(body: RunIn) -> Dict[str, Any]:
     run = {"id": uuid.uuid4().hex[:8], "created": time.time(),
            "intent": body.intent or f"template ({len(nodes)} nodes)", "nodes": nodes,
            "phase": "executing" if body.nodes else "planning", "constraints": [],
+           "prompts": {}, "params": {},
            "stats": {"llm_calls": 0, "execs": 0, "approvals": 0, "patches": 0}}
     async with _lock:
         RUNS[run["id"]] = run
@@ -566,42 +479,126 @@ async def create_run(body: RunIn) -> Dict[str, Any]:
 
 
 @app.get("/runs")
-def list_runs() -> List[Dict[str, Any]]:
+def list_runs() -> list[dict[str, Any]]:
     return [{"id": r["id"], "intent": r["intent"], "created": r["created"],
              "active": _active(r), "phase": r.get("phase", "executing"),
              "constraints": r.get("constraints", []), "plan_ready": _plan_ready(r),
+             "prompts": r.get("prompts", {}), "params": r.get("params", {}),
              "states": {s.value: sum(1 for n in r["nodes"].values() if n.state == s)
                         for s in NodeState}} for r in sorted(RUNS.values(), key=lambda x: -x["created"])]
 
 
 @app.get("/runs/{run_id}")
-def get_run(run_id: str) -> Dict[str, Any]:
+def get_run(run_id: str) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "unknown run")
     return {"id": run["id"], "intent": run["intent"], "active": _active(run),
             "phase": run.get("phase", "executing"),
             "constraints": run.get("constraints", []), "plan_ready": _plan_ready(run),
+            "prompts": run.get("prompts", {}), "params": run.get("params", {}),
             "nodes": {k: v.model_dump(mode="json") for k, v in run["nodes"].items()},
-            "stats": run["stats"], "policy": POLICY,
+            "stats": run["stats"], "policy": POLICY, "warnings": lint(run["nodes"]),
             "pending": sorted(_pending_approvals(run_id))}
 
 
-class ConstraintIn(BaseModel):
-    constraints: List[str]
+@app.get("/runs/{run_id}/snapshot")
+def snapshot(run_id: str) -> dict[str, Any]:
+    """Save-as-template: the run's DAG reset to a fresh POST /runs body — reuse a
+    plan that worked (drug checklist, onboarding flow, paper skeleton) as a
+    template DAG without re-decomposing."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    nodes = []
+    for n in run["nodes"].values():
+        c = n.model_copy(deep=True)
+        c.state, c.result, c.attempts, c.hint = NodeState.PENDING, None, 0, ""
+        c.claimed_at, c.routed_past, c.llm_calls = 0.0, [], 0
+        nodes.append(c.model_dump(mode="json"))
+    return {"intent": run["intent"], "nodes": nodes}
 
 
-class AddedNode(BaseModel):
-    intent: str
-    parent: str = "root"
+@app.get("/runs/{run_id}/knowledge")
+def knowledge(run_id: str) -> dict[str, Any]:
+    """The run's accumulated knowledge tree: every node holding text, nested by
+    branch — leaves are raw evidence, inner nodes are the summaries that rose.
+    This is what patch planning and the planner's 'Known material' context read."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    nodes = run["nodes"]
+    kids: dict[str, list[Node]] = {}
+    for n in nodes.values():
+        if n.parent:
+            kids.setdefault(n.parent, []).append(n)
+
+    def build(nid: str) -> dict[str, Any] | None:
+        ch = [b for c in sorted(kids.get(nid, []), key=lambda x: x.id)
+              for b in [build(c.id)] if b is not None]
+        n = nodes[nid]
+        text = n.result.get("text", "") if isinstance(n.result, dict) else ""
+        if not text and not ch:
+            return None
+        return {"id": nid, "intent": n.intent, "chars": len(text),
+                "text": text[:400], "children": ch}
+
+    return {"knowledge": [b for nid in nodes if not nodes[nid].parent
+                          for b in [build(nid)] if b is not None]}
 
 
-class NodeUpdate(BaseModel):
-    intent: str
+@app.post("/runs/{run_id}/guide")
+async def set_guide(run_id: str, body: GuideIn) -> dict[str, Any]:
+    """An agent's auto-generated per-task guide lands as a 'guide:' constraint —
+    visible and editable in the plan bar like any user constraint. Idempotent:
+    parallel agents racing the root split write it once."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    text = " ".join(body.text.split())[:400]
+    if not text:
+        raise HTTPException(400, "empty guide")
+    added = False
+    async with _lock:
+        cons = run.setdefault("constraints", [])
+        if not any(str(c).startswith("guide:") for c in cons):
+            cons.append(f"guide: {text}")
+            added = True
+            store.save_run(run)
+    if added:
+        await _event(run_id, "info", "plan", "agent", "core",
+                     f"task guide generated: {text[:70]}")
+        await _state(run_id)
+    return {"ok": True, "constraints": run["constraints"]}
+
+
+@app.put("/runs/{run_id}/config")
+async def set_config(run_id: str, body: ConfigIn) -> dict[str, Any]:
+    """Per-run prompt + parameter overrides (the 'adapt it to your domain' knob).
+    Blank/omitted keys keep the built-in defaults; the whole maps are replaced.
+    Validated/clamped through the same resolver the agents use (prompts.py)."""
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown run")
+    if run.get("phase") != "planning":
+        raise HTTPException(409, "config edits only at the planning checkpoint")
+    unknown_p = set(body.params) - set(DEFAULT_PARAMS)
+    if unknown_p:
+        raise HTTPException(400, f"unknown params: {sorted(unknown_p)}")
+    resolved = resolve_params(body.params)
+    params = {k: resolved[k] for k in body.params}
+    prompts = {k: v[:4000] for k, v in body.prompts.items()
+               if k in PROMPT_KEYS and isinstance(v, str) and v.strip()}
+    run["prompts"], run["params"] = prompts, params
+    store.save_run(run)
+    store.log(run_id, "info", "plan", "user", "core",
+              f"config set: prompts={sorted(prompts) or 'defaults'}, params={params or 'defaults'}")
+    await _state(run_id)
+    return {"ok": True, "prompts": prompts, "params": params}
 
 
 @app.post("/runs/{run_id}/nodes")
-async def add_node(run_id: str, body: AddedNode) -> Dict[str, Any]:
+async def add_node(run_id: str, body: AddedNode) -> dict[str, Any]:
     """User adds a branch at the planning checkpoint. It enters ABSTRACT (no tool):
     an agent's LLM claims it and decomposes it against its neighbor context —
     the user's rough idea becomes a fleshed-out sub-tree."""
@@ -628,7 +625,8 @@ async def add_node(run_id: str, body: AddedNode) -> Dict[str, Any]:
         # keep the convergence invariant: the parent's sink (writer with most
         # deps) must consume EVERY sibling, user-added ones included
         sibs = [n for n in run["nodes"].values() if n.parent == body.parent]
-        sink = max((n for n in sibs if n.tool == "llm" and n.deps),
+        sink_name = resolve_params(run.get("params"))["sink_tool"]
+        sink = max((n for n in sibs if n.tool == sink_name and n.deps),
                    key=lambda n: len(n.deps), default=None)
         if sink and nid not in sink.deps:
             sink.deps = [n.id for n in sibs if n.id != sink.id]
@@ -640,7 +638,7 @@ async def add_node(run_id: str, body: AddedNode) -> Dict[str, Any]:
 
 
 @app.patch("/runs/{run_id}/nodes/{nid}")
-async def update_node(run_id: str, nid: str, body: NodeUpdate) -> Dict[str, Any]:
+async def update_node(run_id: str, nid: str, body: NodeUpdate) -> dict[str, Any]:
     """User rewrites a node's instruction while the plan is still open."""
     run = RUNS.get(run_id)
     if not run or nid not in run["nodes"]:
@@ -650,19 +648,28 @@ async def update_node(run_id: str, nid: str, body: NodeUpdate) -> Dict[str, Any]
     n = run["nodes"][nid]
     if n.state not in (NodeState.PENDING, NodeState.WAITING):
         raise HTTPException(409, f"cannot edit {nid} in state {n.state.value}")
-    intent = " ".join(body.intent.split())[:300]
-    if not intent:
-        raise HTTPException(400, "empty intent")
-    n.intent = intent
+    if not body.intent.strip() and body.args is None:
+        raise HTTPException(400, "nothing to update (provide intent and/or args)")
+    if body.args is not None:
+        if not isinstance(body.args, dict):
+            raise HTTPException(400, "args must be an object")
+        if n.tool and n.tool in TOOLS:
+            missing = [k for k in TOOLS[n.tool]["required"] if k not in body.args]
+            if missing:
+                raise HTTPException(400, f"{n.tool} still needs args: {missing}")
+        n.args = body.args
+    if body.intent.strip():
+        intent = " ".join(body.intent.split())[:300]
+        n.intent = intent
     store.save_run(run)
     await _event(run_id, "info", "plan", "user", "core",
-                 f"node {nid} reworded: {intent[:60]}")
+                 f"node {nid} edited by user")
     await _state(run_id)
     return {"ok": True}
 
 
 @app.put("/runs/{run_id}/constraints")
-async def set_constraints(run_id: str, body: ConstraintIn) -> Dict[str, Any]:
+async def set_constraints(run_id: str, body: ConstraintIn) -> dict[str, Any]:
     """User plan feedback (the 'ignore methodology / discuss X' box): stored on the
     run and injected into every decomposition and synthesis prompt from then on."""
     run = RUNS.get(run_id)
@@ -684,7 +691,7 @@ async def set_constraints(run_id: str, body: ConstraintIn) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/go")
-async def go(run_id: str) -> Dict[str, Any]:
+async def go(run_id: str) -> dict[str, Any]:
     """User approved the plan: execution starts bottom-up from the leaves."""
     run = RUNS.get(run_id)
     if not run:
@@ -701,7 +708,7 @@ async def go(run_id: str) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/nodes/{nid}/replan")
-async def replan(run_id: str, nid: str) -> Dict[str, Any]:
+async def replan(run_id: str, nid: str) -> dict[str, Any]:
     """'Break this down further': during planning, turn a node back into an
     abstract planner task (deleting its subtree) so an agent re-decomposes it
     against the current constraints."""
@@ -731,14 +738,14 @@ async def replan(run_id: str, nid: str) -> Dict[str, Any]:
 
 
 @app.get("/runs/{run_id}/events")
-def get_events(run_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
+def get_events(run_id: str, after_id: int = 0) -> list[dict[str, Any]]:
     if run_id not in RUNS:
         raise HTTPException(404, "unknown run")
     return store.events(run_id, after_id)
 
 
 @app.delete("/runs/{run_id}")
-async def delete_run(run_id: str, force: bool = False) -> Dict[str, Any]:
+async def delete_run(run_id: str, force: bool = False) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "unknown run")
@@ -755,13 +762,16 @@ async def delete_run(run_id: str, force: bool = False) -> Dict[str, Any]:
 
 # ---------- endpoints: agent loop ----------
 @app.post("/claim")
-async def claim(body: ClaimIn) -> Dict[str, Any]:
-    terminated: List[str] = []
+async def claim(body: ClaimIn) -> dict[str, Any]:
+    terminated: list[str] = []
     async with _lock:
         candidates = []  # (run, node) ready across active runs
         for run in sorted(RUNS.values(), key=lambda x: x["created"]):
             if not _active(run):
                 continue
+            if not any(n.state in (NodeState.PENDING, NodeState.REPAIRING, NodeState.RUNNING)
+                       for n in run["nodes"].values()):
+                continue   # settled run (no work pending, running, or requeuable): skip scans
             _requeue_stale(run)
             breach = _budget_breach(run)
             if breach:
@@ -773,9 +783,17 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
                 continue
             cands = ready_nodes(run["nodes"])
             if run.get("phase") == "planning":
-                # plan-first: only abstract nodes (further decomposition) are
-                # claimable; tool work waits for the user's /go
-                cands = [n for n in cands if not n.tool]
+                # plan-first: only abstract nodes are claimable, and planning runs on
+                # structure, not results — deps WITHOUT a tool are free context, so the
+                # DONE-gate applies only to tool deps. (Gating abstracts on abstract
+                # deps deadlocks a deps-carrying abstract node: its deps settle after
+                # /go, but /go waits for plan_ready — the 9ea37d2e root.4 corner.)
+                cands = [n for n in run["nodes"].values()
+                         if not n.tool
+                         and n.state in (NodeState.PENDING, NodeState.REPAIRING)
+                         and all(run["nodes"][d].state == NodeState.DONE
+                                 for d in n.deps
+                                 if d in run["nodes"] and run["nodes"][d].tool)]
             candidates += [(run, n) for n in cands]
         if candidates:
             # Algorithm 2 routing: exclude nodes where this agent is in the
@@ -786,7 +804,7 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
             else:
                 candidates = []
         if not candidates:
-            picked: List[Tuple[Dict[str, Any], Node]] = []
+            picked: list[tuple[dict[str, Any], Node]] = []
         else:
             # locality: prefer siblings of the node this agent last worked on (answer 7:
             # agents grow their branch then move up); else deepest ready node
@@ -800,32 +818,32 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
                 first = max(own, key=lambda c: c[1].depth) if own else None
             if first is None:
                 first = max(candidates, key=lambda c: c[1].depth)
-            # parallel ready-set: fill remaining slots from the same run, deepest first
-            want = max(1, min(body.max_nodes, 8))
-            pool = [c for c in candidates if c[0]["id"] == first[0]["id"] and c != first]
-            pool.sort(key=lambda c: -c[1].depth)
-            picked = [first] + pool[: want - 1]
+            picked = [first]   # one node per claim: a claimed-but-unhandled node would
+        # sit RUNNING until its lease expired; parallelism is --scale agent=N
         if picked:
             run, first = picked[0][0], picked[0][1]
-            nodes: List[Node] = []
-            for _, n in picked:
-                n.state = NodeState.RUNNING
-                n.attempts += 1
-                n.claimed_at = time.time()
-                nodes.append(n)
-                store.log(run["id"], "info", "task", "core", body.agent_id,
-                          f"Task: {body.agent_id} claimed {n.id}",
-                          {"node": n.id, "type": "Task"})
+            first.state = NodeState.RUNNING
+            first.attempts += 1
+            first.claimed_at = time.time()
+            store.log(run["id"], "info", "task", "core", body.agent_id,
+                      f"Task: {body.agent_id} claimed {first.id}",
+                      {"node": first.id, "type": "Task"})
             AGENTS[body.agent_id] = {"last_seen": time.time(), "run_id": run["id"],
                                      "node_id": first.id, "phase": "claimed"}
             store.save_run(run)
+            nodes: list[Node] = [first]
             inputs = {d: run["nodes"][d].result for d in first.deps}
             siblings = [{"id": s.id, "state": s.state.value}
                         for s in run["nodes"].values()
                         if s.parent == first.parent and s.id != first.id]
             parent = run["nodes"].get(first.parent) if first.parent else None
+            known = [{"id": n.id, "intent": n.intent[:60],
+                      "chars": len(str(n.result.get("text", "")))}
+                     for n in sorted(run["nodes"].values(), key=lambda x: x.id)
+                     if isinstance(n.result, dict) and n.result.get("text")][:20]
             context = {"parent_intent": parent.intent if parent else "",
                        "run_intent": run["intent"],
+                       "known": known,
                        "siblings": [{"id": s.id, "intent": s.intent, "tool": s.tool}
                                     for s in run["nodes"].values()
                                     if s.parent == first.parent and s.id != first.id]}
@@ -839,11 +857,12 @@ async def claim(body: ClaimIn) -> Dict[str, Any]:
             "nodes": [n.model_dump(mode="json") for n in nodes],
             "inputs": inputs, "siblings": siblings, "tools": TOOLS,
             "constraints": run.get("constraints", []), "context": context,
+            "prompts": run.get("prompts", {}), "params": run.get("params", {}),
             "max_depth": POLICY["max_depth"]}
 
 
 @app.post("/runs/{run_id}/nodes/{nid}/redirect")
-async def redirect(run_id: str, nid: str, body: RedirectIn) -> Dict[str, Any]:
+async def redirect(run_id: str, nid: str, body: RedirectIn) -> dict[str, Any]:
     """Agent handoff: release the node with a reason; another agent picks it up."""
     run = RUNS.get(run_id)
     if not run or nid not in run["nodes"]:
@@ -866,15 +885,18 @@ async def redirect(run_id: str, nid: str, body: RedirectIn) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/nodes/{nid}/result")
-async def report(run_id: str, nid: str, body: ResultIn) -> Dict[str, Any]:
+async def report(run_id: str, nid: str, body: ResultIn) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run or nid not in run["nodes"]:
         raise HTTPException(404, "unknown run or node")
     async with _lock:
-        run["stats"]["llm_calls"] += body.llm_calls
         n = run["nodes"][nid]
         if n.state != NodeState.RUNNING:
+            # checked BEFORE the spend lands: a stale report must not eat the
+            # run's llm_calls budget (it 409s — nothing was credited)
             raise HTTPException(409, f"stale report: {nid} is {n.state.value}, not RUNNING")
+        run["stats"]["llm_calls"] += body.llm_calls
+        n.llm_calls += body.llm_calls
         n.claimed_at = 0.0
         if body.state == "DONE":
             n.state, n.result, n.hint = NodeState.DONE, body.result, ""
@@ -912,7 +934,7 @@ async def report(run_id: str, nid: str, body: ResultIn) -> Dict[str, Any]:
     await _state(run_id)
     return {"ok": True}
 @app.post("/runs/{run_id}/nodes/{nid}/decompose")
-async def decompose(run_id: str, nid: str, body: DecomposeIn) -> Dict[str, Any]:
+async def decompose(run_id: str, nid: str, body: DecomposeIn) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run or nid not in run["nodes"]:
         raise HTTPException(404, "unknown run or node")
@@ -932,7 +954,7 @@ async def decompose(run_id: str, nid: str, body: DecomposeIn) -> Dict[str, Any]:
     # must bounce into the agent's repair loop now, not into the user's dialog later
     check = Patch(ops=[{"op": "add_node", "node": c.model_dump()} for c in children],
                   reason=f"decompose {nid}")
-    _, verrs = apply_patch(run["nodes"], check, TOOLS, POLICY["max_depth"],
+    _, verrs = apply_patch(run["nodes"], check, _known_tools(run), POLICY["max_depth"],
                            POLICY["max_nodes"], POLICY["auto_approve"])
     if verrs:
         raise HTTPException(400, verrs)
@@ -957,13 +979,14 @@ async def decompose(run_id: str, nid: str, body: DecomposeIn) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/patch")
-async def patch_run(run_id: str, patch: Patch) -> Dict[str, Any]:
+async def patch_run(run_id: str, patch: Patch) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "unknown run")
     async with _lock:
         new_nodes, errs = apply_patch(run["nodes"], patch, TOOLS, POLICY["max_depth"],
                                       POLICY["max_nodes"], POLICY["auto_approve"])
+        errs += tool_arg_errors(new_nodes) if not errs else []
         if errs:
             raise HTTPException(400, errs)
         for n in new_nodes.values():  # user fix: re-open BLOCKED nodes whose ancestors cleared
@@ -981,19 +1004,28 @@ async def patch_run(run_id: str, patch: Patch) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/exec")
-async def exec_tool(run_id: str, body: ExecIn) -> Dict[str, Any]:
+async def exec_tool(run_id: str, body: ExecIn) -> dict[str, Any]:
     run = RUNS.get(run_id)
     if not run or body.node_id not in run["nodes"]:
         raise HTTPException(404, "unknown run or node")
     if body.tool not in TOOLS:
         raise HTTPException(400, f"unknown tool {body.tool!r}")
-    needs_approval = POLICY["confirm_actions"] and body.tool not in POLICY["auto_approve"]
+    node = run["nodes"][body.node_id]
+    # $from bindings resolve against dep results HERE (server-side), so what the
+    # sandbox runs — and what the approval card shows — is the final data
+    args, err = resolve_args(run["nodes"], Node(**{**node.model_dump(), "args": body.args}))
+    if err:
+        raise HTTPException(400, err)
+    # unvetted = dropped+synced after startup: a human must see it once, even if
+    # auto_approve names it (a planted file must not widen the approved surface silently)
+    needs_approval = POLICY["confirm_actions"] and (
+        body.tool not in POLICY["auto_approve"] or bool(TOOLS[body.tool].get("unvetted")))
     a = {"id": uuid.uuid4().hex[:8], "run_id": run_id, "node_id": body.node_id,
-         "kind": "exec", "tool": body.tool, "args": body.args,
+         "kind": "exec", "tool": body.tool, "args": args, "attempts": node.attempts,
          "status": "pending" if needs_approval else "done",
          "result": None, "created": time.time()}
     if not needs_approval:   # execute outside the lock: shell may run up to 60s
-        a["result"] = await _exec_tool(body.tool, body.args)
+        a["result"] = await _exec_tool(body.tool, args)
     async with _lock:
         run["stats"]["execs"] += 1
         if needs_approval:
@@ -1009,7 +1041,7 @@ async def exec_tool(run_id: str, body: ExecIn) -> Dict[str, Any]:
 
 
 @app.get("/exec/{exec_id}")
-def exec_status(exec_id: str) -> Dict[str, Any]:
+def exec_status(exec_id: str) -> dict[str, Any]:
     a = store.approval(exec_id)
     if not a:
         raise HTTPException(404, "unknown exec")
@@ -1018,12 +1050,12 @@ def exec_status(exec_id: str) -> Dict[str, Any]:
 
 
 @app.get("/approvals")
-def approvals(status: str = "pending") -> List[Dict[str, Any]]:
+def approvals(status: str = "pending") -> list[dict[str, Any]]:
     return store.approvals(status)
 
 
 @app.post("/approvals/{aid}")
-async def decide(aid: str, body: DecisionIn) -> Dict[str, Any]:
+async def decide(aid: str, body: DecisionIn) -> dict[str, Any]:
     a = store.approval(aid)
     if not a:
         raise HTTPException(404, "unknown approval")
@@ -1068,6 +1100,22 @@ async def decide(aid: str, body: DecisionIn) -> Dict[str, Any]:
         return {"exec_id": aid, "status": a["status"], "result": a["result"]}
     # kind == exec
     if approved:
+        # staleness gate: the agent gives up on an unanswered card (APPROVAL_TIMEOUT),
+        # reports, and the node can be re-claimed and re-run. A late approval must
+        # NOT replay the tool (mutation replay) — the attempts epoch pins the card
+        # to the claim that parked it, and terminal states block it outright.
+        node = run["nodes"].get(a["node_id"]) if run else None
+        if (node is None or a.get("attempts", node.attempts) != node.attempts
+                or node.state in (NodeState.DONE, NodeState.BLOCKED, NodeState.ESCALATED)):
+            a["status"] = "stale"
+            async with _lock:
+                store.save_approval(a)
+            await _event(a["run_id"], "warn", "approval", "user", "core",
+                         f"stale exec card for {a['node_id']} ignored (node moved on)")
+            await _broadcast({"type": "approval", "approval": a})
+            return {"exec_id": aid, "status": "stale", "result": None}
+        if a["tool"] in TOOLS:   # first vetted use: a human just approved it by name
+            TOOLS[a["tool"]].pop("unvetted", None)
         args = body.args if body.args is not None else a["args"]
         a["args"] = args
         a["result"] = await _exec_tool(a["tool"], args)   # outside lock: shell may run 60s
@@ -1084,12 +1132,12 @@ async def decide(aid: str, body: DecisionIn) -> Dict[str, Any]:
 
 # ---------- metrics (P5: paper §V definitions) ----------
 @app.get("/metrics")
-def metrics() -> Dict[str, Any]:
+def metrics() -> dict[str, Any]:
     """latency (run start→last event), TSR (intents with all nodes DONE),
     FRT (failed node → its DONE report), delegation depth (max node depth),
     KG-consistency proxy (first-pass success: DONE nodes at attempts==1)."""
-    per_run: Dict[str, Any] = {}
-    frt_samples: List[int] = []
+    per_run: dict[str, Any] = {}
+    frt_samples: list[int] = []
     done_total = done_first_pass = 0
     for run in RUNS.values():
         evs = store.events(run["id"])
@@ -1097,8 +1145,8 @@ def metrics() -> Dict[str, Any]:
         nodes = list(run["nodes"].values())
         all_done = bool(nodes) and all(n.state == NodeState.DONE for n in nodes)
         # FRT: pair each FAILED result with the next DONE result on the same node
-        fails: Dict[str, List[float]] = {}
-        frts: List[int] = []
+        fails: dict[str, list[float]] = {}
+        frts: list[int] = []
         for e in evs:
             p = e.get("payload") or {}
             if e["kind"] == "result" and p.get("node"):
@@ -1138,7 +1186,7 @@ def metrics() -> Dict[str, Any]:
 
 # ---------- workspace proxy (read-only, for the UI files panel) ----------
 @app.get("/workspace/files")
-async def ws_files(path: str = ".") -> Dict[str, Any]:
+async def ws_files(path: str = ".") -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(CFG["sandbox_url"] + "/list_dir", json={"path": path})
@@ -1149,7 +1197,7 @@ async def ws_files(path: str = ".") -> Dict[str, Any]:
 
 
 @app.get("/workspace/file")
-async def ws_file(path: str) -> Dict[str, Any]:
+async def ws_file(path: str) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(CFG["sandbox_url"] + "/read_file", json={"path": path})

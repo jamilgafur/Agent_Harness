@@ -109,7 +109,7 @@
   <button onclick="showHelp()" title="how this works" style="font-size:14px;padding:4px 11px">ⓘ</button>
 </header>
 
-<div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showOutput()" title="results of the selected run">📄 output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
+<div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showKnowledge()" title="accumulated knowledge tree of the selected run">🌳 knowledge</button><button class="tab" onclick="showOutput()" title="results of the selected run">📄 output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
 
 <div class="panel" id="planbar" style="display:none;margin:8px 14px 0"></div>
 <div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
@@ -145,6 +145,7 @@ function ws(){
     if(m.type==='state'){ const r=ALL[m.run_id]||(ALL[m.run_id]={});
       r.nodes=m.nodes; r.stats=m.stats; r.active=m.active; r.pending=new Set(m.pending||[]);
       r.phase=m.phase; r.constraints=m.constraints||[]; r.plan_ready=m.plan_ready;
+      r.prompts=m.prompts||{}; r.params=m.params||{}; r.warnings=m.warnings||[];
       drawTabs(); planBar(); attention(); if(m.run_id===RUN){draw(); loadFiles();} }
     if(m.type==='agents'){AGENTS=m.agents; drawAgentsPanel(); attention();}
     if(m.type==='log'){ if(m.event.run_id===RUN) logLine(m.event); }
@@ -163,6 +164,7 @@ async function refreshRuns(){
     const s=await api('GET',`/runs/${r.id}`);
     ALL[r.id]={intent:r.intent,created:r.created,nodes:s.nodes,stats:s.stats,active:s.active,
                phase:s.phase,constraints:s.constraints||[],plan_ready:s.plan_ready,
+               prompts:s.prompts||{},params:s.params||{},warnings:s.warnings||[],
                pending:new Set(s.pending||[])};
   }
   for(const id of Object.keys(ALL)) if(!ids.has(id)) delete ALL[id];
@@ -197,13 +199,34 @@ function planBar(){
   const gated=Object.values(r.nodes||{}).filter(x=>!x.tool&&x.state==='PENDING'&&
      (x.deps||[]).some(d=>(r.nodes[d]||{}).tool)).length;
   // re-render only when something meaningful changed — the input must keep focus
-  const key=RUN+'|'+n+'|'+gated+'|'+r.plan_ready+'|'+(r.constraints||[]).join('§');
+  const key=RUN+'|'+n+'|'+gated+'|'+r.plan_ready+'|'+(r.constraints||[]).join('§')+'|'+JSON.stringify(r.prompts||{})+JSON.stringify(r.params||{});
   if(key===PLANBAR_KEY) return;
   PLANBAR_KEY=key;
+  const pr=r.prompts||{}, pa=r.params||{};
+  const cfHtml=`
+    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--dim)">⚙ prompts &amp; parameters (advanced)</summary>
+    <div style="margin-top:6px;color:var(--dim);font-size:11.5px">blank = built-in default · applies to everything decomposed/written after saving</div>
+    <div style="margin-top:4px;color:var(--dim);font-size:11px">decompose prompt</div>
+    <textarea id="p_decompose" placeholder="default (built-in)" style="min-height:40px">${esc(pr.decompose||'')}</textarea>
+    <div style="margin-top:4px;color:var(--dim);font-size:11px">synthesize prompt</div>
+    <textarea id="p_synthesize" placeholder="default (built-in)" style="min-height:40px">${esc(pr.synthesize||'')}</textarea>
+    <div style="margin-top:4px;color:var(--dim);font-size:11px">judge prompt</div>
+    <textarea id="p_judge" placeholder="default (built-in)" style="min-height:40px">${esc(pr.judge||'')}</textarea>
+    <div class="row" style="margin-top:6px">
+      <input id="pm_model" placeholder="default (env MODEL)" value="${esc(pa.model||'')}" title="model" style="min-width:150px">
+      <input id="pm_temperature" type="number" min="0" max="1" step="0.05" placeholder="temperature" title="temperature 0..1" value="${pa.temperature??''}" style="width:110px">
+      <input id="pm_child_cap" type="number" min="1" max="6" placeholder="child cap" title="child cap 1..6" value="${pa.child_cap??''}" style="width:90px">
+      <input id="pm_max_results" type="number" min="3" max="10" placeholder="max results" title="max results 3..10" value="${pa.max_results??''}" style="width:100px">
+      <input id="pm_gather_tools" placeholder="gather tools, comma-separated" title="gather tools" value="${esc((pa.gather_tools||[]).join(','))}" style="min-width:170px">
+      <input id="pm_sink_tool" placeholder="sink tool" title="sink tool" value="${esc(pa.sink_tool||'')}" style="width:100px">
+      <button onclick="saveConfig()">save overrides</button>
+    </div>
+    </details>`;
   const chips=(r.constraints||[]).map((c,i)=>`<span class="chip">${esc(c)} <b style="cursor:pointer;color:#f85149" onclick="delConstraint(${i})" title="remove">✕</b></span>`).join(' ');
   bar.innerHTML=`<b>📋 planning the run — nothing executes until you approve</b>
     <span class="chip">${r.plan_ready?`plan ready · ${n} nodes`:`decomposing… ${n} nodes so far`}</span>
     ${gated?`<span class="chip" title="these branches plan further once their searches return results">${gated} branch${gated===1?'':'es'} refine after results</span>`:''}
+    ${(r.warnings||[]).length?`<span class="chip attn" title="${esc(r.warnings.join('\n'))}">⚠ ${r.warnings.length} warning${r.warnings.length===1?'':'s'} — hover</span>`:''}
     <div style="margin-top:8px;color:var(--dim);font-size:12px;line-height:1.6">
       The agents broke your request into atomic steps (the tree below). Review it:
       add constraints or instructions (e.g. <i>ignore methodology</i>, <i>discuss cost</i>),
@@ -220,7 +243,19 @@ function planBar(){
     <div class="row" style="margin-top:8px">
       <button style="border-color:#3fb950;color:#3fb950;padding:7px 18px;font-weight:bold" onclick="goRun()" ${r.plan_ready?'':'disabled title="planners still working…"'}>✔ plan is good — start bottom-up execution</button>
       <button onclick="addBranch('root')" title="add a new branch under the head — the LLM fleshes it out from what you type">＋ add a top-level branch</button>
-    </div>`;
+    </div>${cfHtml}`;
+}
+async function saveConfig(){
+  const prompts={}, params={};
+  for(const k of ['decompose','synthesize','judge']){ const v=$('p_'+k).value.trim(); if(v) prompts[k]=v; }
+  const model=$('pm_model').value.trim(); if(model) params.model=model;
+  const t=$('pm_temperature').value; if(t!=='') params.temperature=+t;
+  const cc=$('pm_child_cap').value; if(cc!=='') params.child_cap=+cc;
+  const mr=$('pm_max_results').value; if(mr!=='') params.max_results=+mr;
+  const gt=$('pm_gather_tools').value.trim(); if(gt) params.gather_tools=gt.split(',').map(s=>s.trim()).filter(Boolean);
+  const st=$('pm_sink_tool').value.trim(); if(st) params.sink_tool=st;
+  await api('PUT',`/runs/${RUN}/config`,{prompts,params});
+  PLANBAR_KEY=''; planBar();
 }
 async function setConstraints(list){
   const clean=[...new Set(list.map(x=>String(x).trim()).filter(Boolean))];
@@ -256,6 +291,16 @@ async function editIntent(rid,nid){
     await api('PATCH',`/runs/${rid}/nodes/${nid}`,{intent:text});
     clickNode(nid);
   });
+}
+function editArgs(rid,nid){
+  const n=(ALL[rid].nodes||{})[nid]||{};
+  $('modalbody').innerHTML=`<b>⚙ args — ${esc(nid)} <span style="color:var(--dim)">${esc(n.tool||'')}</span></b>
+    <textarea id="argedit" style="min-height:220px;margin-top:6px">${esc(JSON.stringify(n.args||{},null,2))}</textarea>
+    <div class="row" style="margin-top:8px"><button id="argsave" style="border-color:#58a6ff;color:#58a6ff;padding:6px 16px">save args</button><button onclick="$('modal').style.display='none'">cancel</button></div>`;
+  $('modal').style.display='flex';
+  $('argsave').onclick=async()=>{ let a; try{a=JSON.parse($('argedit').value);}catch(e){return alert('bad JSON');}
+    await api('PATCH',`/runs/${rid}/nodes/${nid}`,{args:a});
+    $('modal').style.display='none'; clickNode(nid); };
 }
 async function selRun(rid){
   if(!ALL[rid]||rid===RUN)return;
@@ -548,6 +593,21 @@ function mdLite(s){
   h=h.replace(/^- (?!\s*<a)(.*)$/gm,'• $1');
   return h;
 }
+function ktree(k,d){
+  const rows=(k.children||[]).map(c=>ktree(c,d+1)).join('');
+  const own=k.chars?`<span style="color:var(--mut);font-size:11px">${k.chars}ch</span>
+    <div style="color:var(--mut);white-space:pre-wrap;font-size:11.5px">${esc(k.text||'').slice(0,240)}</div>`:'';
+  return `<div style="margin-left:${d*18}px;border-left:${d?'1px solid var(--line)':'none'};padding:3px 8px">
+    <b style="font-size:12px">${esc(k.id)}</b> · ${esc(k.intent||'')} ${own}</div>`+rows;
+}
+async function showKnowledge(){
+  if(!RUN)return;
+  const k=await fetch(`/runs/${RUN}/knowledge`).then(r=>r.json());
+  const rows=(k.knowledge||[]).map(t=>ktree(t,0)).join('')||'nothing yet — knowledge accumulates as branches finish';
+  $('modalbody').innerHTML=`<b>🌳 knowledge tree — what the run knows so far</b>
+    <div style="margin-top:8px;max-height:56vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#0d1420;font-size:12px">${rows}</div>`;
+  $('modal').style.display='flex';
+}
 function showOutput(){
   const r=ALL[RUN]; if(!r)return;
   const head=headText(r);
@@ -558,6 +618,7 @@ function showOutput(){
     <div class="row" style="margin-top:8px">
       <button onclick="downloadOutput()" title="save the answer as a markdown file">⬇ download</button>
       <button onclick="copyOutput(this)" title="copy the answer to the clipboard">⧉ copy</button>
+      <button onclick="downloadTemplate()" title="save this run's plan as a reusable template DAG (paste into ＋ → template DAG)">⬇ template</button>
       ${r.intent?`<button onclick="rerun()" title="start a fresh run with the same request">⟳ run again</button>`:''}
       <button onclick="$('modal').style.display='none'">close</button></div>`;
   $('modal').style.display='flex';
@@ -567,6 +628,13 @@ function downloadOutput(){
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([`# ${(r&&r.intent)||'harness output'}\n\n${LASTOUT}\n`],{type:'text/markdown'}));
   a.download=`${RUN||'run'}-output.md`;
+  a.click(); URL.revokeObjectURL(a.href);
+}
+async function downloadTemplate(){
+  const t=await api('GET',`/runs/${RUN}/snapshot`);
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(t,null,2)],{type:'application/json'}));
+  a.download=`${RUN||'run'}-template.json`;
   a.click(); URL.revokeObjectURL(a.href);
 }
 async function copyOutput(btn){
@@ -592,6 +660,7 @@ async function clickNode(nid){
   const rows=[['intent',n.intent],['tool',n.tool||'(planner — LLM decomposes this)'],
       n.success_predicate?['success when',n.success_predicate]:null,
       n.attempts>1?['attempts',n.attempts]:null,
+      n.llm_calls?['llm calls',n.llm_calls]:null,
       n.hint?['⚠ hint',n.hint]:null].filter(Boolean);
   $('detail').innerHTML=
     `<div style="margin:4px 0"><span style="background:${stColor}22;color:${stColor};border:1px solid ${stColor};padding:2px 12px;border-radius:10px;font-weight:bold">${n.state}</span></div>
@@ -602,6 +671,7 @@ async function clickNode(nid){
         ?`<div style="margin-top:8px">${n.tool?`<div class="chip" style="margin-bottom:6px">held — runs after you approve the plan</div><br>`:''}
           <button onclick="addBranch('${nid}')" title="add a sub-branch under this node — the LLM reasons it out from the neighbor context">＋ add a branch here</button>
           <button onclick="editIntent('${rid}','${nid}')" title="rewrite this node's instruction">✎ edit intent</button>
+          ${n.tool?`<button onclick="editArgs('${rid}','${nid}')" title="edit this node's tool arguments as JSON">⚙ args</button>`:''}
           <button onclick="replanNode('${rid}','${nid}')" title="delete this subtree and let the planner break it down again (against your constraints)">✏️ break down further</button></div>`:''}
      ${['ESCALATED','FAILED'].includes(n.state)?`<div style="margin-top:8px"><button onclick="retry('${rid}','${nid}')">fix &amp; retry</button></div>`:''}`;
 }
