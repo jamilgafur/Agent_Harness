@@ -21,7 +21,15 @@ services:
       CORE_URL: http://core:8000
       HARNESS_CONFIG: ${HARNESS_CONFIG:-}
     extra_hosts: ["host.docker.internal:host-gateway"]
-    depends_on: [sandbox]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      sandbox:
+        condition: service_healthy
 
   sandbox:
     image: harness:latest
@@ -36,6 +44,12 @@ services:
       WORKSPACE: /workspace
       SEARX_URL: ${SEARX_URL:-http://host.docker.internal:8095}
     extra_hosts: ["host.docker.internal:host-gateway"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=4)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   agent:
     image: harness:latest
@@ -50,7 +64,9 @@ services:
       CORE_URL: http://core:8000
       HARNESS_CONFIG: ${HARNESS_CONFIG:-}
     extra_hosts: ["host.docker.internal:host-gateway"]
-    depends_on: [core]
+    depends_on:
+      core:
+        condition: service_healthy
     deploy:
       replicas: 1
 

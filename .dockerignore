@@ -1,8 +1,24 @@
-.venv
+# Only requirements.txt, harness/ and harness.toml are copied into the image
+# (see Dockerfile) — keep everything else out.
 .git
+.venv
 __pycache__
 *.pyc
-main.pdf
+.ruff_cache/
+.pytest_cache/
+tests/
+examples/
+.github/
+data/
+workspace/
+.env
+.env.example
+*.md
+LICENSE
+ruff.toml
+Dockerfile
+compose.yaml
+docker-compose.override.yml
 plan.txt
-data
-workspace
+main.pdf
+.DS_Store

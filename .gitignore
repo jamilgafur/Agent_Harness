@@ -1,7 +1,37 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / lint tooling
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Harness runtime data — runs, workspaces, and local env are never committed
 data/
 workspace/
 .env
+
+# Process artifacts
+*.pid
+
+# Docker local overrides (machine-specific tuning stays local)
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~
