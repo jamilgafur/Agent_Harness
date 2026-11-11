@@ -15,6 +15,17 @@ def test_validate_ok_and_ready_progress():
     assert [n.id for n in ready_nodes(nodes)] == ["b"]
 
 
+def test_ready_nodes_resilient_writer_runs_on_terminal_deps():
+    a = Node(id="a", intent="gather", tool="shell", args={"cmd": "x"})
+    w = Node(id="w", intent="answer", deps=["a"], tool="llm")
+    nodes = {"a": a, "w": w}
+    a.state = NodeState.FAILED
+    assert [n.id for n in ready_nodes(nodes)] == []              # strict: waits
+    assert [n.id for n in ready_nodes(nodes, resilient=["w"])] == ["w"]
+    a.state = NodeState.RUNNING      # not terminal yet -> the writer still waits
+    assert ready_nodes(nodes, resilient=["w"]) == []
+
+
 def test_tool_node_needs_predicate_unless_auto_approved():
     n = {"x": Node(id="x", intent="work", tool="write_file",
                    args={"path": "f", "content": "c"})}

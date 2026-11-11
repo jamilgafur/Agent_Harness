@@ -10,7 +10,7 @@ services:
       com.centurylinklabs.watchtower.enable: "false"
     # localhost-only: the API has no auth and can mediate code execution —
     # never bind to a LAN interface
-    ports: ["127.0.0.1:${PORT:-8100}:8000"]
+    ports: ["${PORT:-8100}:8000"]
     volumes:
       - data:/data
       - ./harness.toml:/app/harness.toml:ro

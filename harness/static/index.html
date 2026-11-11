@@ -4,38 +4,85 @@
 <meta charset="utf-8">
 <title>Agent Harness</title>
 <style>
-  :root { --bg:#0b0f14; --panel:#12181f; --line:#2b333c; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; }
-  * { box-sizing:border-box; font:13px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  button, input, textarea, .chip, .tab, #log, #detail { font-family:ui-monospace,SFMono-Regular,monospace; }
-  body { margin:0; background:var(--bg); color:var(--fg); }
-  header { display:flex; gap:14px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; background:var(--panel); position:sticky; top:0; z-index:5; }
+  /* ---------------- design tokens ---------------- */
+  :root {
+    --bg:#0d1117; --panel:#131922; --panel2:#18202c; --inset:#0f141d;
+    --line:#242d3a; --line2:#303b4b; --fg:#e8eef6; --dim:#97a3b2; --mut:#97a3b2;
+    --acc:#5a9bff; --ok:#3fb950; --warn:#e3b341; --wait:#d29922; --err:#f85149; --violet:#bc4cf0;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.55 var(--sans);
+         -webkit-font-smoothing:antialiased; }
+
+  /* ---------------- header / chips ---------------- */
+  header { display:flex; gap:10px; align-items:center; padding:0 14px; height:46px;
+           border-bottom:1px solid var(--line); background:var(--panel);
+           position:sticky; top:0; z-index:30; }
+  .brand { font-size:12.5px; font-weight:700; letter-spacing:.14em; text-transform:uppercase;
+           display:flex; align-items:center; gap:8px; margin-right:6px; }
+  .brand .mark { width:9px; height:9px; border-radius:2px; background:var(--acc);
+                 box-shadow:0 0 10px var(--acc); transform:rotate(45deg); }
+  header .spacer { flex:1; }
   h1 { font-size:15px; margin:0; }
-  .chip { padding:2px 9px; border-radius:10px; border:1px solid var(--line); font-size:12px; color:var(--dim); }
-  .chip.attn { color:#e3b341; border-color:#e3b341; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:8px 14px; }
-  details.dev summary { cursor:pointer; color:var(--dim); user-select:none; }
-  details.dev[open] summary { margin-bottom:8px; }
+  .chip { padding:3px 11px; border-radius:999px; border:1px solid var(--line2); font-size:12px;
+          color:var(--dim); font-family:var(--mono); background:var(--inset); white-space:nowrap;
+          display:inline-flex; align-items:center; gap:5px; }
+  .chip.attn { color:var(--warn); border-color:#e3b34166; background:#e3b34114; }
+
+  /* ---------------- controls ---------------- */
+  button, input, textarea, select { font:12.5px var(--sans); background:var(--inset); color:var(--fg);
+    border:1px solid var(--line2); border-radius:7px; padding:6px 12px; }
+  button { cursor:pointer; transition:border-color .12s, background .12s, transform .06s; }
+  button:hover { border-color:var(--acc); } button:active { transform:translateY(1px); }
+  button:disabled { opacity:.5; cursor:default; }
+  input:focus, textarea:focus { outline:none; border-color:var(--acc); box-shadow:0 0 0 3px #5a9bff29; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#0b1524; font-weight:650; }
+  button.ok { border-color:#3fb95099; color:var(--ok); font-weight:650; }
+  button.ok:hover { background:#3fb9501f; border-color:var(--ok); }
+  button.danger { border-color:#f8514977; color:var(--err); }
+  button.danger:hover { background:#f8514914; border-color:var(--err); }
+  textarea { width:100%; min-height:64px; font:12px/1.5 var(--mono); }
+  .tabbtn.on { border-color:var(--acc); color:var(--acc); }
+  #log, #detail, #tools .trow, #files, .chip { font-family:var(--mono); }
+
+  /* ---------------- layout ---------------- */
+  #layout { padding:10px 14px 14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:11px 13px; box-shadow:0 2px 8px #00000044; margin-bottom:10px; }
+  .ptitle { font-size:11px; font-weight:700; letter-spacing:.09em; text-transform:uppercase;
+            color:var(--dim); display:flex; align-items:center; gap:8px; margin-bottom:7px; }
+  .ptitle .right { margin-left:auto; font-weight:400; letter-spacing:0; text-transform:none; }
+  .rail3 { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(0,1fr) minmax(0,1fr); gap:10px; }
+  .rail3 .panel { margin-bottom:0; background:var(--panel2); }
+  @media (max-width:1150px){ .rail3 { grid-template-columns:1fr; } .rail3 .panel { margin-bottom:10px; } }
+  #planbar { display:none; border-color:#e3b34155; border-left:3px solid var(--warn); }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  button, input, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
-  button { cursor:pointer; } button:hover { border-color:#58a6ff; }
-  textarea { width:100%; min-height:64px; font-size:12px; }
-  .tabbtn.on { border-color:#58a6ff; color:#58a6ff; }
-  #viewport { position:relative; height:52vh; min-height:340px; border:1px solid var(--line); border-top:none; overflow:hidden; background:
-      radial-gradient(circle, #1d2530 1px, transparent 1px) 0 0/24px 24px, var(--bg); cursor:grab; margin:0 14px; border-radius:0 0 8px 8px; }
+  details.dev summary, details.cmp summary { cursor:pointer; color:var(--dim); user-select:none; }
+  details.dev[open] summary { margin-bottom:8px; }
+
+  /* ---------------- canvas ---------------- */
+  #viewport { position:relative; height:calc(100vh - 330px); min-height:400px;
+              border:1px solid var(--line); border-radius:10px; overflow:hidden;
+              background:radial-gradient(circle, #1b2430 1px, transparent 1px) 0 0/26px 26px, #0a0e13;
+              cursor:grab; margin-bottom:10px; box-shadow:0 2px 8px #00000044; }
   #viewport:active { cursor:grabbing; }
   #canvas { position:absolute; inset:0; width:100%; height:100%; }
-  .node rect { fill:#161d26; stroke:#8b949e; stroke-width:1.4; rx:8; }
-  .node text { fill:var(--fg); font-size:11px; pointer-events:none; }
+
+  /* ---------------- DAG nodes ---------------- */
+  .node rect { fill:var(--panel2); stroke:#8b949e; stroke-width:1.4; rx:8; }
+  .node text { fill:var(--fg); font-size:11px; pointer-events:none; font-family:var(--sans); }
   .node .sub { fill:var(--dim); font-size:9.5px; }
   .node { cursor:pointer; }
-  .node.RUNNING rect { stroke:#58a6ff; stroke-width:2; animation:pulse 1.4s infinite; }
-  .node.DONE rect { stroke:#3fb950; } .node.PENDING rect { stroke:#8b949e; }
-  .node.WAITING rect { stroke:#d29922; } .node.REPAIRING rect { stroke:#e3b341; stroke-dasharray:5 3; }
-  .node.FAILED rect, .node.BLOCKED rect { stroke:#f85149; }
-  .node.ESCALATED rect { stroke:#bc4cf0; }
+  .node.RUNNING rect { stroke:var(--acc); stroke-width:2; animation:pulse 1.4s infinite; }
+  .node.DONE rect { stroke:var(--ok); } .node.PENDING rect { stroke:#8b949e; }
+  .node.WAITING rect { stroke:var(--wait); } .node.REPAIRING rect { stroke:var(--warn); stroke-dasharray:5 3; }
+  .node.FAILED rect, .node.BLOCKED rect { stroke:var(--err); }
+  .node.ESCALATED rect { stroke:var(--violet); }
   .node.needsApproval rect { animation:flash 1s infinite; }
   @keyframes pulse { 0%,100%{stroke-opacity:1} 50%{stroke-opacity:.35} }
-  @keyframes flash { 0%,100%{stroke:#e3b341; stroke-width:1.8} 50%{stroke:#ffd757; stroke-width:4} }
+  @keyframes flash { 0%,100%{stroke:var(--warn); stroke-width:1.8} 50%{stroke:#ffd757; stroke-width:4} }
   .nw.born { animation:pop .45s ease; }
   @keyframes pop { from { opacity:0; transform:scale(.55); } }
   .edge { fill:none; stroke:#3b4654; stroke-width:1.6; }
@@ -43,85 +90,206 @@
   .edge.born { stroke-dasharray:700; stroke-dashoffset:700; animation:dashin .6s ease forwards; }
   @keyframes dashin { to { stroke-dashoffset:0; } }
   .agent { pointer-events:none; }
-  .agent circle { fill:#0b0f14; stroke-width:2.2; }
+  .agent circle { fill:var(--bg); stroke-width:2.2; }
   .agent text { fill:var(--fg); font-size:10px; font-weight:bold; }
   .agent .ph { font-size:9px; fill:var(--dim); }
-  .agent.needhelp .q { fill:#e3b341; font-size:15px; font-weight:bold; }
+  .agent.needhelp .q { fill:var(--warn); font-size:15px; font-weight:bold; }
   .trail { fill:none; stroke-width:2.4; pointer-events:none; opacity:.55; }
-  #log { height:130px; overflow:auto; font-size:12px; }
-  #log div { padding:1px 4px; border-radius:4px; }
-  #log .warn { color:#e3b341; } #log .error { color:#f85149; }
-  #detail { white-space:pre-wrap; font-size:11.5px; color:var(--dim); max-height:220px; overflow:auto; }
-  #modal { position:fixed; inset:0; background:#0009; display:none; align-items:center; justify-content:center; z-index:10; }
-  #modal .card { width:min(720px,92vw); max-height:86vh; overflow:auto; border-radius:12px; box-shadow:0 14px 44px #000b; }
-  .agrow { display:flex; gap:10px; flex-wrap:wrap; }
-  .acard { border:1px solid var(--line); border-radius:8px; padding:6px 10px; min-width:150px; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
-  /* ---------- n8n-style node cards ---------- */
-  .node .card { fill:#1a2230; stroke:#2f3946; stroke-width:1.2; filter:drop-shadow(0 3px 6px #0007); rx:10; }
-  .node:hover .card { stroke:#58a6ff; }
+  .node .card { fill:var(--panel2); stroke:var(--line2); stroke-width:1.2; filter:drop-shadow(0 3px 6px #0007); rx:10; }
+  .node:hover .card { stroke:var(--acc); }
   .node .rail { rx:3; }
-  .node .port { fill:#0b0f14; stroke:#6e7c8e; stroke-width:1.6; }
+  .node .port { fill:var(--bg); stroke:#6e7c8e; stroke-width:1.6; }
   .node .icon { font-size:19px; }
-  .node .t1 { fill:var(--fg); font-size:11.5px; font-weight:bold; }
+  .node .t1 { fill:var(--fg); font-size:11.5px; font-weight:650; }
   .node .t2 { fill:var(--fg); font-size:11px; opacity:.85; }
-  .node .bdg circle { fill:#e3b341; }
+  .node .bdg circle { fill:var(--warn); }
   .node .bdg text { fill:#111; font-size:11px; font-weight:bold; }
-  .node.DONE .rail { fill:#3fb950; } .node.DONE .port.out { fill:#3fb950; stroke:#3fb950; }
-  .node.RUNNING .rail { fill:#58a6ff; animation:railpulse 1.4s infinite; }
-  .node.WAITING .rail { fill:#d29922; }
-  .node.REPAIRING .rail { fill:#e3b341; }
-  .node.FAILED .rail, .node.BLOCKED .rail { fill:#f85149; }
-  .node.ESCALATED .rail { fill:#bc4cf0; }
+  .node.DONE .rail { fill:var(--ok); } .node.DONE .port.out { fill:var(--ok); stroke:var(--ok); }
+  .node.RUNNING .rail { fill:var(--acc); animation:railpulse 1.4s infinite; }
+  .node.WAITING .rail { fill:var(--wait); }
+  .node.REPAIRING .rail { fill:var(--warn); }
+  .node.FAILED .rail, .node.BLOCKED .rail { fill:var(--err); }
+  .node.ESCALATED .rail { fill:var(--violet); }
   .node.PENDING .rail { fill:#6e7c8e; }
-  .node.RUNNING .card { stroke:#58a6ff; }
+  .node.RUNNING .card { stroke:var(--acc); }
   .node.needsApproval .card { animation:flash 1s infinite; }
   .node.needsApproval .bdg { animation:bob 1s infinite; }
-  .resdot { fill:#3fb950; }
+  .resdot { fill:var(--ok); }
   .outnode { cursor:pointer; }
   .outnode .card { fill:#142018; stroke:#3fb95088; }
-  .outnode:hover .card { stroke:#3fb950; }
+  .outnode:hover .card { stroke:var(--ok); }
   @keyframes railpulse { 0%,100%{opacity:1} 50%{opacity:.35} }
   @keyframes bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
-  /* ---------- n8n-style run tabs ---------- */
-  #tabbar { display:flex; gap:2px; align-items:flex-end; padding:0 14px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:37px; z-index:5; }
+
+  /* ---------------- run tabs ---------------- */
+  #tabbar { display:flex; gap:4px; align-items:stretch; padding:0 14px; background:var(--panel);
+            border-bottom:1px solid var(--line); position:sticky; top:46px; z-index:25; }
   .tab { display:inline-flex; align-items:center; gap:2px; border:1px solid transparent; border-bottom:none; background:transparent; color:var(--dim);
-         border-radius:8px 8px 0 0; padding:7px 12px 6px; font-size:12px; max-width:300px;
+         border-radius:8px 8px 0 0; padding:8px 13px 7px; font-size:12.5px; max-width:320px;
          overflow:hidden; white-space:nowrap; cursor:pointer; }
-  .tab:hover { color:var(--fg); background:#161d26; }
-  .tab.on { color:var(--fg); background:var(--bg); border-color:var(--line); position:relative; margin-bottom:-1px; padding-bottom:7px; }
+  .tab:hover { color:var(--fg); background:var(--panel2); }
+  .tab.on { color:var(--fg); background:var(--bg); border-color:var(--line); position:relative; margin-bottom:-1px; padding-bottom:8px; }
   .tab .tlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; display:inline-flex; align-items:center; }
   .tab .tdot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; flex-shrink:0; }
-  .tab .tdel { margin-left:10px; padding:0 6px; border-radius:6px; color:#f85149; opacity:.75; font-weight:bold; flex-shrink:0; }
+  .tab .tdel { margin-left:10px; padding:0 6px; border-radius:6px; color:var(--err); opacity:.65; font-weight:bold; flex-shrink:0; }
   .tab .tdel:hover { opacity:1; background:#f8514926; }
-  .tab.plus { color:#58a6ff; font-size:15px; padding:6px 11px; }
-  .dot.on { background:#3fb950; } .dot.off { background:#555; }
+  .tab.plus { color:var(--acc); font-size:15px; padding:2px 12px; align-self:center; }
+  .dot.on { background:var(--ok); } .dot.off { background:#555; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+
+  /* ---------------- log / inspector / tools / files ---------------- */
+  #log { height:128px; overflow:auto; font-size:11.5px; background:var(--inset);
+         border:1px solid var(--line); border-radius:7px; padding:6px 8px; }
+  #log div { padding:1px 4px; border-radius:4px; }
+  #log .warn { color:var(--warn); } #log .error { color:var(--err); }
+  #detail { white-space:pre-wrap; font-size:11.5px; color:var(--dim); max-height:280px; overflow:auto; }
+  .agrow { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .acard { border:1px solid var(--line); border-radius:7px; padding:6px 11px; min-width:150px; background:var(--inset); }
+  #tools .trow { display:flex; gap:8px; align-items:baseline; padding:5px 0; border-bottom:1px solid var(--line); font-size:12px; }
+  #tools .trow:last-child { border-bottom:none; }
+  #tools .tname { color:var(--fg); font-weight:600; }
+  #tools .tmeta { color:var(--dim); font-size:11px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #tools .tag { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line2); color:var(--dim); flex-shrink:0; }
+  #tools .tag.dyn { color:var(--violet); border-color:#bc4cf066; }
+  label.f { display:block; margin-top:8px; font-size:11px; color:var(--mut); }
+  label.f input, label.f textarea { margin-top:3px; }
+  #files { max-height:120px; overflow:auto; margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+
+  /* ---------------- modal ---------------- */
+  #modal { position:fixed; inset:0; background:#060a10cc; backdrop-filter:blur(3px); display:none;
+           align-items:center; justify-content:center; z-index:50; }
+  #modal .card { width:min(760px,92vw); max-height:86vh; overflow:auto; border-radius:12px;
+                 box-shadow:0 14px 44px #000b; }
+
+  /* ---------------- toasts ---------------- */
+  #toasts { position:fixed; right:14px; bottom:14px; z-index:80; display:flex;
+            flex-direction:column; gap:8px; pointer-events:none; max-width:min(420px,92vw); }
+  .toast { pointer-events:auto; display:flex; gap:9px; align-items:flex-start;
+           background:var(--panel); border:1px solid var(--line2); border-left:3px solid var(--acc);
+           border-radius:9px; padding:9px 12px; font-size:12.5px; color:var(--fg);
+           box-shadow:0 8px 24px #0008; animation:toastin .25s ease; }
+  .toast.ok { border-left-color:var(--ok); }
+  .toast.warn { border-left-color:var(--warn); }
+  .toast.error { border-left-color:var(--err); }
+  .toast .tmsg { flex:1; line-height:1.45; word-break:break-word; }
+  .toast .tx { cursor:pointer; color:var(--dim); padding:0 2px; }
+  .toast .tx:hover { color:var(--fg); }
+  @keyframes toastin { from { opacity:0; transform:translateY(8px); } }
+
+  /* ---------------- new-run FAB ---------------- */
+  #fab { position:fixed; right:18px; bottom:18px; z-index:40; border-radius:999px;
+         padding:13px 20px; font-size:14px; font-weight:700; background:var(--acc);
+         border-color:var(--acc); color:#0b1524; box-shadow:0 8px 24px #5a9bff55; }
+  #fab:hover { background:#6ba6ff; border-color:#6ba6ff; }
+  #toasts:not(:empty) ~ #fab { bottom:18px; }
+
+  /* ---------------- settings ---------------- */
+  .setrow { display:flex; align-items:center; gap:10px; justify-content:space-between;
+            padding:9px 2px; border-bottom:1px solid var(--line); }
+  .setrow:last-child { border-bottom:none; }
+  .setrow .slabel { color:var(--fg); font-size:12.5px; }
+  .setrow .shint { color:var(--dim); font-size:11px; margin-top:1px; }
+  .setrow select, .setrow input[type=number] { min-width:110px; }
+  .switch { position:relative; width:38px; height:20px; flex-shrink:0; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch .track { position:absolute; inset:0; background:var(--inset); border:1px solid var(--line2);
+                   border-radius:999px; transition:background .15s; }
+  .switch .track:before { content:""; position:absolute; width:14px; height:14px; border-radius:50%;
+                          background:var(--dim); top:2px; left:3px; transition:.15s; }
+  .switch input:checked + .track { background:var(--acc); border-color:var(--acc); }
+  .switch input:checked + .track:before { transform:translateX(17px); background:#0b1524; }
+  .setsec { margin:14px 0 4px; font-size:11px; font-weight:700; letter-spacing:.09em;
+            text-transform:uppercase; color:var(--dim); }
+
+  /* ---------------- light theme ---------------- */
+  body[data-theme="light"] {
+    --bg:#f4f6fa; --panel:#ffffff; --panel2:#f0f3f8; --inset:#eef1f6;
+    --line:#d5dce4; --line2:#c2cbd6; --fg:#1d2733; --dim:#5b6a7a; --mut:#5b6a7a;
+    --acc:#2563eb; --ok:#16a34a; --warn:#b45309; --wait:#b45309; --err:#dc2626; --violet:#9333ea;
+  }
+  body[data-theme="light"] #viewport { background:radial-gradient(circle, #d9dfe8 1px, transparent 1px) 0 0/26px 26px, #e9edf3; }
+  body[data-theme="light"] .node rect { stroke:#8a97a8; }
+  body[data-theme="light"] .node text { fill:var(--fg); }
+  body[data-theme="light"] .edge { stroke:#a8b4c2; }
+  body[data-theme="light"] .node .card { fill:var(--panel2); filter:drop-shadow(0 3px 5px #0002); }
+  body[data-theme="light"] .outnode .card { fill:#e7f6ec; }
+  body[data-theme="light"] .panel { box-shadow:0 2px 8px #00101818; }
+  body[data-theme="light"] #log { background:var(--inset); }
+  body[data-theme="light"] .chip { background:var(--inset); }
+  body[data-theme="light"] .toast { box-shadow:0 8px 24px #0012; }
+  body[data-theme="light"] #modal { background:#4a556766; }
+  body[data-theme="light"] button.primary, body[data-theme="light"] #fab { color:#fff; }
+
+  /* ---------------- reduced motion ---------------- */
+  body.no-anim *, body.no-anim *:before, body.no-anim *:after {
+    animation:none !important; transition:none !important; }
+
+  /* ---------------- compact / mobile ---------------- */
+  @media (max-width:760px){
+    body { font-size:14px; }
+    header { flex-wrap:wrap; height:auto; padding:6px 10px; row-gap:6px; }
+    #tabbar { top:0; position:static; }
+    .tab { max-width:200px; }
+    #viewport { height:calc(100vh - 420px); min-height:300px; }
+    #fab { right:12px; bottom:12px; padding:11px 16px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>⛓ Agent Harness</h1>
+  <span class="brand"><span class="mark"></span>Agent Harness</span>
   <span class="chip" id="health">…</span>
   <span class="chip" id="attention"></span>
   <span class="chip" id="agentcount"></span>
-  <span class="chip" id="metrics" title="TSR · avg latency · delegation depth · first-pass"></span>
-  <span class="chip"><button onclick="fit()">fit all</button><button onclick="zoom(1.25)">+</button><button onclick="zoom(0.8)">−</button></span>
-  <button onclick="showHelp()" title="how this works" style="font-size:14px;padding:4px 11px">ⓘ</button>
+  <span class="chip" id="metrics" title="task success · avg latency · delegation depth · first-pass"></span>
+  <span class="spacer"></span>
+  <span class="chip"><button onclick="fit()" title="recenter the graph">fit all</button><button onclick="zoom(1.25)" title="zoom in">+</button><button onclick="zoom(0.8)" title="zoom out">−</button></span>
+  <button onclick="showSettings()" title="settings — theme, motion, budgets">⚙</button>
+  <button onclick="showHelp()" title="how this works">ⓘ</button>
 </header>
 
-<div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showKnowledge()" title="accumulated knowledge tree of the selected run">🌳 knowledge</button><button class="tab" onclick="showOutput()" title="results of the selected run">📄 output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
+<div id="tabbar"><span id="tabs" style="display:flex;overflow-x:auto;flex:1"></span><button class="tab" onclick="showKnowledge()" title="accumulated knowledge tree of the selected run">knowledge</button><button class="tab" onclick="showOutput()" title="results of the selected run">output</button><button class="tab plus" onclick="newRun()" title="new run">＋</button></div>
 
-<div class="panel" id="planbar" style="display:none;margin:8px 14px 0"></div>
-<div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
-<div class="panel"><b>Node</b> <span id="detailhint" class="chip">click a node</span><div id="detail"></div></div>
-<div class="panel"><b>Workspace files</b> <button onclick="loadFiles()">refresh</button> <span class="chip" id="filespath"></span>
-  <div id="files" class="row" style="max-height:110px;overflow:auto;margin-top:6px"></div></div>
-<details class="panel dev"><summary>🛠 developer — live agents &amp; event log (debug)</summary>
-  <div class="agrow" id="agents" style="margin-bottom:8px"></div>
-  <b>Events</b><div id="log"></div>
-</details>
+<div id="layout">
+  <div class="panel" id="planbar"></div>
+  <div id="viewport"><svg id="canvas"><g id="world"></g><g id="agentlayer"></g></svg></div>
+
+  <div class="rail3">
+    <div class="panel">
+      <div class="ptitle">Node inspector <span class="chip right" id="detailhint">click a node</span></div>
+      <div id="detail"></div>
+    </div>
+    <div class="panel">
+      <div class="ptitle">Tools &amp; skills <span class="right"><button onclick="loadTools()">refresh</button></span></div>
+      <div id="tools"><span class="chip">loading…</span></div>
+      <details class="cmp" style="margin-top:8px">
+        <summary>＋ register a skill — usable at the next claim</summary>
+        <label class="f">name<input id="sk_name" placeholder="count_lines" spellcheck="false"></label>
+        <label class="f">description<input id="sk_desc" placeholder="count the lines of a workspace file"></label>
+        <label class="f">required args (comma-separated)<input id="sk_args" placeholder="path" spellcheck="false"></label>
+        <label class="f">shell template — {arg} placeholders<textarea id="sk_cmd" placeholder="wc -l < {path}" spellcheck="false" style="min-height:44px"></textarea></label>
+        <div style="margin-top:8px;font-size:11px;color:var(--mut)">New skills land <i>unvetted</i>: first use shows a human an approval card.</div>
+        <div class="row" style="margin-top:8px">
+          <button class="ok" onclick="createSkill()">register skill</button>
+          <span class="chip" id="skillhint"></span>
+        </div>
+      </details>
+    </div>
+    <div class="panel">
+      <div class="ptitle">Workspace files <span class="right"><button onclick="loadFiles()">refresh</button> <span class="chip" id="filespath"></span></span></div>
+      <div id="files"></div>
+    </div>
+  </div>
+
+  <details class="panel dev"><summary>Developer — live agents &amp; event log</summary>
+    <div class="agrow" id="agents"></div>
+    <div class="ptitle">Events</div><div id="log"></div>
+  </details>
+</div>
 
 <div id="modal"><div class="panel card"><div id="modalbody"></div></div></div>
+<div id="toasts"></div>
+<button id="fab" onclick="newRun()" title="start a new run">＋ New run</button>
 
 <script>
 // ---------- state ----------
@@ -131,13 +299,44 @@ const SEEN=new Set(), POSPREV={}, AGPOS={}, ANIM={};
 let view={x:40,y:30,k:1}; const W=228,H=64,CW=320,RH=88;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- toasts ----------
+let TOAST_N=0;
+function toast(msg,kind='info',ms=4200){
+  const box=$('toasts'); if(!box)return;
+  const t=document.createElement('div'); t.className='toast '+kind; t.dataset.n=++TOAST_N;
+  t.innerHTML=`<span class="tmsg">${msg}</span><span class="tx" title="dismiss">✕</span>`;
+  t.querySelector('.tx').onclick=()=>t.remove();
+  box.appendChild(t);
+  while(box.children.length>4) box.firstChild.remove();
+  setTimeout(()=>{ if(t.parentNode){ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(()=>t.remove(),320);} }, ms);
+}
+
+// ---------- settings (persisted in localStorage) ----------
+const SETDEF={theme:'dark',font:13,anim:true,devOpen:false,autoFit:true};
+const UI={...SETDEF,...(JSON.parse(localStorage.getItem('harness_ui')||'{}'))};
+function saveUI(patch){
+  Object.assign(UI,patch);
+  localStorage.setItem('harness_ui',JSON.stringify(UI));
+  applyUI();
+}
+function applyUI(){
+  document.body.dataset.theme=UI.theme;
+  document.body.style.fontSize=UI.font+'px';
+  document.body.classList.toggle('no-anim',!UI.anim);
+  const dev=document.querySelector('details.dev'); if(dev) dev.open=!!UI.devOpen;
+}
+let POLICY={};   // server policy mirror (ws + /policy), used by settings panel
+
 const api=async(m,p,b)=>{const r=await fetch(p,{method:m,headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined});
-  const j=await r.json().catch(()=>({})); if(!r.ok){logLine({level:'error',msg:`${m} ${p}: ${JSON.stringify(j.detail??j)}`}); throw new Error(r.status);} return j;};
+  const j=await r.json().catch(()=>({})); if(!r.ok){const e={level:'error',msg:`${m} ${p}: ${JSON.stringify(j.detail??j)}`};logLine(e);toast(esc(e.msg),'error',6000); throw new Error(r.status);} return j;};
 
 // ---------- boot / ws ----------
 async function boot(){
-  const h=await api('GET','/health'); $('health').textContent=`core ✓ ollama ${h.ollama?'✓':'✗'}`;
-  await refreshRuns(); ws(); loadFiles(); requestAnimationFrame(tick);
+  applyUI();
+  const h=await api('GET','/health'); $('health').textContent=`core ✓ · ollama ${h.ollama?'✓':'✗'} · ${h.agents} agents`;
+  try{ POLICY=await api('GET','/policy'); }catch(e){}
+  await refreshRuns(); ws(); loadFiles(); loadTools(); requestAnimationFrame(tick);
 }
 function ws(){
   const s=new WebSocket(`ws://${location.host}/ws`); WS=s;
@@ -146,13 +345,14 @@ function ws(){
       r.nodes=m.nodes; r.stats=m.stats; r.active=m.active; r.pending=new Set(m.pending||[]);
       r.phase=m.phase; r.constraints=m.constraints||[]; r.plan_ready=m.plan_ready;
       r.prompts=m.prompts||{}; r.params=m.params||{}; r.warnings=m.warnings||[];
-      drawTabs(); planBar(); attention(); if(m.run_id===RUN){draw(); loadFiles();} }
+      drawTabs(); planBar(); attention(); if(m.run_id===RUN){draw(); filesMaybeRefresh(m.nodes);} }
     if(m.type==='agents'){AGENTS=m.agents; drawAgentsPanel(); attention();}
     if(m.type==='log'){ if(m.event.run_id===RUN) logLine(m.event); }
     if(m.type==='approval'){ attention(); const r=ALL[m.approval.run_id];
       if(r){ r.pending=r.pending||new Set();
         m.approval.status==='pending'?r.pending.add(m.approval.node_id):r.pending.delete(m.approval.node_id); draw(); } }
     if(m.type==='run'){ refreshRuns(); }
+    if(m.type==='policy'){ POLICY=m.policy||{}; }
     if(m.type==='run_deleted'){ delete ALL[m.run_id]; if(RUN===m.run_id){RUN=null;$('detail').textContent='';} refreshRuns(); }
   };
   s.onclose=()=>setTimeout(ws,3000);
@@ -171,14 +371,22 @@ async function refreshRuns(){
   if(!RUN&&runs[0]) RUN=runs[0].id;
   if(RUN&&!ALL[RUN]) RUN=runs[0]?runs[0].id:null;
   drawTabs(); planBar();
-  if(RUN){ $('log').innerHTML=''; (await api('GET',`/runs/${RUN}/events`)).forEach(logLine); draw(); fit(); }
+  if(RUN){ $('log').innerHTML=''; (await api('GET',`/runs/${RUN}/events`)).forEach(logLine); draw(); if(UI.autoFit)fit(); }
   const m=await api('GET','/metrics');
   const t=m.total;
   $('metrics').textContent=t.tsr_pct===null?'no finished runs'
     :`TSR ${t.tsr_pct}% · ${(t.avg_latency_ms/1000).toFixed(0)}s · depth ${t.max_delegation_depth} · 1st-pass ${t.first_pass_pct}%`;
   attention();
 }
+let TABS_KEY='';
 function drawTabs(){
+  // memoized: WS state messages arrive per-node-transition; skip identical re-renders
+  const key=RUN+'|'+Object.entries(ALL).map(([rid,r])=>{
+    const nodes=Object.values(r.nodes||{});
+    return rid+nodes.length+nodes.filter(n=>n.state==='DONE').length+
+           (r.pending||new Set()).size+(r.active?1:0)+(r.phase==='planning'?1:0)+(r.plan_ready?1:0);
+  }).join('|');
+  if(key===TABS_KEY)return; TABS_KEY=key;
   $('tabs').innerHTML=Object.entries(ALL).sort((a,b)=>(b[1].created||0)-(a[1].created||0)).map(([rid,r])=>{
     const nodes=Object.values(r.nodes||{}), total=nodes.length, done=nodes.filter(n=>n.state==='DONE').length;
     const pend=(r.pending||new Set()).size, esc_=nodes.filter(n=>n.state==='ESCALATED').length;
@@ -241,7 +449,8 @@ function planBar(){
       <button onclick="setConstraints([...(ALL[RUN].constraints||[]),document.getElementById('consinput').value])">add</button>
       ${chips}</div>
     <div class="row" style="margin-top:8px">
-      <button style="border-color:#3fb950;color:#3fb950;padding:7px 18px;font-weight:bold" onclick="goRun()" ${r.plan_ready?'':'disabled title="planners still working…"'}>✔ plan is good — start bottom-up execution</button>
+      <button class="ok" style="padding:7px 18px;font-weight:bold" onclick="goRun()" ${r.plan_ready?'':'disabled title="planners still working…"'}>✔ plan is good — start bottom-up execution</button>
+      ${!r.plan_ready?`<button class="danger" onclick="goRun()" title="start with the plan as-is now${gated?` — ${gated} branch${gated===1?'':'es'} will refine after results arrive`:''}; nodes still missing never happen">⚠ start partial plan anyway</button>`:''}
       <button onclick="addBranch('root')" title="add a new branch under the head — the LLM fleshes it out from what you type">＋ add a top-level branch</button>
     </div>${cfHtml}`;
 }
@@ -255,18 +464,20 @@ async function saveConfig(){
   const gt=$('pm_gather_tools').value.trim(); if(gt) params.gather_tools=gt.split(',').map(s=>s.trim()).filter(Boolean);
   const st=$('pm_sink_tool').value.trim(); if(st) params.sink_tool=st;
   await api('PUT',`/runs/${RUN}/config`,{prompts,params});
+  toast('✓ prompts &amp; parameters saved — applies to everything decomposed from now on','ok');
   PLANBAR_KEY=''; planBar();
 }
 async function setConstraints(list){
   const clean=[...new Set(list.map(x=>String(x).trim()).filter(Boolean))];
   PLANBAR_KEY='';
   await api('PUT',`/runs/${RUN}/constraints`,{constraints:clean});
+  toast('✓ constraints updated','ok');
   planBar();
 }
 async function delConstraint(i){
   const r=ALL[RUN]; await setConstraints((r.constraints||[]).filter((_,j)=>j!==i));
 }
-async function goRun(){ PLANBAR_KEY=''; await api('POST',`/runs/${RUN}/go`); planBar(); }
+async function goRun(){ PLANBAR_KEY=''; await api('POST',`/runs/${RUN}/go`); planBar(); toast('▶ plan approved — execution started','ok'); }
 async function replanNode(rid,nid){
   await api('POST',`/runs/${rid}/nodes/${nid}/replan`);
   $('detail').textContent=''; $('detailhint').textContent='click a node'; draw();
@@ -306,17 +517,53 @@ async function selRun(rid){
   if(!ALL[rid]||rid===RUN)return;
   RUN=rid; PLANBAR_KEY=''; $('log').innerHTML=''; $('detail').textContent=''; $('detailhint').textContent='click a node';
   (await api('GET',`/runs/${rid}/events`)).forEach(logLine);
-  drawTabs(); planBar(); draw(); fit();
+  drawTabs(); planBar(); draw(); if(UI.autoFit)fit();
 }
 async function delRun(rid){
   const active=ALL[rid]&&ALL[rid].active;
   if(!confirm(active?`run ${rid} is ACTIVE — stop it and delete?`:'delete run '+rid+'?'))return;
   await api('DELETE',`/runs/${rid}${active?'?force=1':''}`); delete ALL[rid];
+  toast(`run ${esc(rid)} deleted`,'ok');
   refreshRuns();
 }
 
+// ---------- tools & skills panel ----------
+async function loadTools(){
+  try{
+    const t=await api('GET','/tools'); const p=await api('GET','/policy');
+    const auto=new Set(p.auto_approve||[]);
+    $('tools').innerHTML=Object.entries(t.tools||{}).map(([name,s])=>
+      `<div class="trow"><span class="tname">${esc(name)}</span>
+        <span class="tmeta" title="${esc(s.desc||'')} · required: ${(s.required||[]).join(', ')||'—'}">${esc(s.desc||'')}</span>
+        ${s.dynamic?'<span class="tag dyn" title="runtime-registered tool">dynamic</span>':''}
+        ${s.dynamic&&s.unvetted?'<span class="tag dyn" title="not vetted yet — first use shows an approval card">unvetted</span>':''}
+        ${auto.has(name)?'<span class="tag" title="auto-approved — runs without a card">auto</span>':''}
+      </div>`).join('')||'<span class="chip">none</span>';
+  }catch(e){$('tools').innerHTML='<span class="chip">core unreachable</span>';}
+}
+async function createSkill(){
+  const name=$('sk_name').value.trim(), desc=$('sk_desc').value.trim(),
+        required=$('sk_args').value.split(',').map(s=>s.trim()).filter(Boolean),
+        cmd=$('sk_cmd').value;
+  if(!name||!cmd.trim()) return;
+  try{
+    const r=await api('POST','/skills',{name,desc,required,cmd});
+    $('skillhint').textContent=`✓ ${r.created} registered — visible at the next claim`;
+    toast(`✓ skill ${esc(r.created)} registered — first use shows an approval card`,'ok');
+    $('sk_name').value=$('sk_desc').value=$('sk_args').value=$('sk_cmd').value='';
+    loadTools();
+  }catch(e){$('skillhint').textContent='rejected — check name/placeholders';}
+}
+
+
 // ---------- workspace files panel ----------
-let FILESDIR='';
+let FILESDIR='', FILES_SIG='';
+function filesMaybeRefresh(nodes){
+  // auto-refresh only when a node produced new output — not on every state tick
+  const produced=Object.values(nodes||{}).filter(n=>n.result!=null).length;
+  const sig=RUN+':'+produced;
+  if(sig!==FILES_SIG){ FILES_SIG=sig; loadFiles(); }
+}
 async function loadFiles(dir){
   FILESDIR=dir??FILESDIR;
   try{
@@ -378,8 +625,18 @@ const ICON=n=>n.type==='loop'?'⟳':!n.tool?'✦':n.tool.startsWith('mcp_')?'�
 function clampTitle(s){ s=String(s||''); return [s.slice(0,24), s.length>24 ? s.slice(24,44)+(s.length>44?'…':'') : '']; }
 
 // ---------- draw the selected run ----------
+let DRAW_KEY='';
 function draw(){
-  const r=ALL[RUN]; let html=''; FOREST={};
+  const r=ALL[RUN];
+  // dirty-check: skip the full innerHTML rebuild when nothing visible changed.
+  // Key covers node set, states, attempts, results, hints, pending approvals and run.
+  const nodes=r?r.nodes||{}:{};
+  const key=(RUN||'')+'|'+Object.keys(nodes).length+'|'+
+    Object.values(nodes).map(n=>n.state+(n.attempts||0)+(n.result!=null?1:0)+(n.hint?'!':'')).join('.')+
+    '|'+[...((r&&r.pending)||[])].sort().join(',');
+  if(key===DRAW_KEY)return;
+  DRAW_KEY=key;
+  let html=''; FOREST={};
   if(!r){
     html=`<text x="40" y="60" fill="#8b949e" font-size="14">no runs — hit ＋ to let the AI build one</text>`;
   } else {
@@ -497,7 +754,13 @@ function drawAgentsPanel(){
      <div class="sub">beat ${a.age}s ago</div></div>`).join('')||'<span class="chip">none seen yet</span>');
   $('agentcount').textContent=`agents: ${Object.values(AGENTS).filter(a=>a.alive).length}`;
 }
-async function attention(){
+let ATT_T=null;
+function attention(){
+  // trailing debounce: state messages arrive in bursts; one /approvals poll per burst
+  if(ATT_T)return;
+  ATT_T=setTimeout(async()=>{ATT_T=null; await _attention();},250);
+}
+async function _attention(){
   const pending=await api('GET','/approvals?status=pending');
   const esc_=Object.values(ALL).reduce((s,r)=>s+Object.values(r.nodes||{}).filter(n=>n.state==='ESCALATED').length,0);
   const planReady=Object.entries(ALL).filter(([_,r])=>r.plan_ready);
@@ -565,8 +828,10 @@ function showHelp(){
   final answer — download, copy, or re-run from there. Every page used was actually read
   (📖 read vs 🔗 link-only on searches), and sources are listed at the end.<br>
   <b style="color:var(--fg)">Controls</b> — drag background to pan · wheel to zoom · <i>fit all</i> recenters ·
-  click a card for details + its readable result · tabs switch runs · ✕ deletes a run
-  (active ones ask first). The <b>🛠 developer</b> section below the graph keeps live agents + the event log.<br>
+  click a card for details + its readable result · tabs switch runs · ✕ deletes a run. The <b>🛠 developer</b>
+  section below the graph keeps live agents + the event log (hide it in ⚙ settings).<br>
+  <b style="color:var(--fg)">Settings (⚙)</b> — theme, font size, animations, auto-fit, plus server-wide
+  resource limits (agents, LLM-call and time budgets, repairs) saved live.<br>
   <b style="color:var(--fg)">Safety rails</b> — per-run budgets (max LLM calls / seconds / depth / nodes) with a
   governor that terminates (keeps work) on breach; full event audit in the log panel and <i>events.jsonl</i>.</div>
   <div class="row" style="margin-top:10px"><button onclick="$('modal').style.display='none'">got it</button></div>`;
@@ -708,8 +973,52 @@ async function decide(id,ok){
   const body = ok ? {decision:'approve',args} : {decision:'reject'};
   const r=await api('POST',`/approvals/${id}`,body);
   logLine({level:r.status==='done'?'info':'warn',msg:`approval ${id}: ${r.status}`});
+  toast(ok?'✔ approved — the agent continues':'✖ rejected — the agent rethinks', ok?'ok':'warn');
   $('modal').style.display='none'; attention();
 }
+
+// ---------- settings panel ----------
+function setRow(label,hint,ctrl){
+  return `<div class="setrow"><div><div class="slabel">${label}</div><div class="shint">${hint}</div></div>${ctrl}</div>`;
+}
+function showSettings(){
+  const p=POLICY||{};
+  $('modalbody').innerHTML=`<b>⚙ settings</b>
+    <div class="setsec">appearance</div>
+    ${setRow('theme','dark or light interface',`<select id="set_theme"><option value="dark" ${UI.theme==='dark'?'selected':''}>dark</option><option value="light" ${UI.theme==='light'?'selected':''}>light</option></select>`)}
+    ${setRow('font size','base UI font (10–18px)',`<input id="set_font" type="number" min="10" max="18" value="${UI.font}">`)}
+    ${setRow('animations','node pulses, agent movement, transitions',`<label class="switch"><input id="set_anim" type="checkbox" ${UI.anim?'checked':''}><span class="track"></span></label>`)}
+    ${setRow('auto-fit graph','recenter when switching runs',`<label class="switch"><input id="set_autofit" type="checkbox" ${UI.autoFit?'checked':''}><span class="track"></span></label>`)}
+    ${setRow('developer panel','live agents &amp; event log below the graph',`<label class="switch"><input id="set_dev" type="checkbox" ${UI.devOpen?'checked':''}><span class="track"></span></label>`)}
+    <div class="setsec">resources &amp; safety — server-wide, saved live (values are clamped server-side)</div>
+    ${setRow('max agents','parallel workers (1–32)',`<input id="set_agents" type="number" min="1" max="32" value="${p.max_agents??''}">`)}
+    ${setRow('max LLM calls / run','budget governor limit',`<input id="set_llm" type="number" min="10" max="100000" value="${p.max_llm_calls??''}">`)}
+    ${setRow('max seconds / run','wall-clock budget',`<input id="set_secs" type="number" min="60" max="86400" value="${p.max_seconds??''}">`)}
+    ${setRow('max repairs / node','before escalation',`<input id="set_repairs" type="number" min="1" max="10" value="${p.max_repairs??''}">`)}
+    ${setRow('confirm actions','approval cards for tools not auto-approved',`<label class="switch"><input id="set_confirm" type="checkbox" ${p.confirm_actions?'checked':''}><span class="track"></span></label>`)}
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveSettings()">save limits</button>
+      <button onclick="resetSettings()">reset appearance</button>
+      <button onclick="$('modal').style.display='none'">close</button>
+      <span class="chip" id="sethint"></span></div>`;
+  $('modal').style.display='flex';
+  $('set_theme').onchange=e=>saveUI({theme:e.target.value});
+  $('set_font').onchange=e=>saveUI({font:Math.min(18,Math.max(10,+e.target.value||13))});
+  $('set_anim').onchange=e=>saveUI({anim:e.target.checked});
+  $('set_autofit').onchange=e=>saveUI({autoFit:e.target.checked});
+  $('set_dev').onchange=e=>saveUI({devOpen:e.target.checked});
+}
+async function saveSettings(){
+  const patch={max_agents:+$('set_agents').value,max_llm_calls:+$('set_llm').value,
+               max_seconds:+$('set_secs').value,max_repairs:+$('set_repairs').value,
+               confirm_actions:$('set_confirm').checked};
+  try{
+    POLICY=await api('POST','/policy',patch);
+    $('sethint').textContent='✓ saved — applies to new work immediately';
+    toast('✓ resource limits saved','ok');
+  }catch(e){ $('sethint').textContent='rejected by server'; }
+}
+function resetSettings(){ saveUI({...SETDEF}); toast('appearance reset to defaults','ok'); }
 
 // ---------- new run ----------
 let RUNTAB=0;
@@ -742,11 +1051,16 @@ async function submitRun(){
   if(RUNTAB===0){ body={intent:v}; }
   else { try{body=JSON.parse(v);}catch(e){return alert('bad JSON');} }
   const r=await api('POST','/runs',body);
-  $('modal').style.display='none'; await refreshRuns(); selRun(r.run_id);
+  $('modal').style.display='none';
+  toast(`✓ run ${esc(r.run_id)} created — ${RUNTAB===0?'agents are planning it now':'running the template'}`,'ok');
+  await refreshRuns(); selRun(r.run_id);
 }
+let LAST_ERR_TOAST='';
 function logLine(e){const t=e.ts?new Date(e.ts*1000).toLocaleTimeString():new Date().toLocaleTimeString();
   const d=document.createElement('div');d.className=e.level||'';d.textContent=`${t} [${e.kind||'-'}] ${e.sender||''}→${e.receiver||''} ${e.msg}`;
-  $('log').prepend(d); while($('log').children.length>150)$('log').lastChild.remove();}
+  $('log').prepend(d); while($('log').children.length>150)$('log').lastChild.remove();
+  // surface failures as toasts too (deduped) — budget kills escalations must not hide in a log
+  if(e.level==='error'&&e.msg&&e.msg!==LAST_ERR_TOAST){LAST_ERR_TOAST=e.msg;toast('⛔ '+esc(e.msg),'error',7000);}}
 boot();
 </script>
 </body>

@@ -3,6 +3,8 @@
 The sandbox HTTP call is monkeypatched; approvals and the state machine are
 exercised for real against a temp SQLite file.
 """
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -90,6 +92,188 @@ def test_failure_repairs_then_escalates_and_cascades(client):
     run = client.get(f"/runs/{run_id}").json()
     assert run["nodes"]["w"]["state"] == "PENDING"
     assert run["nodes"]["r"]["state"] == "PENDING"
+
+
+def test_escalated_child_collapses_dead_waiting_branch(client):
+    """A terminal child failure must collapse its all-terminal WAITING parent
+    (settle needs all-DONE, so otherwise the run stays 'active' forever) and
+    bubble to the root — the run ends honestly instead of spinning."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "big task"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "first", "tool": "write_file", "args": {"path": "f", "content": "c"},
+         "success_predicate": "exists"},
+        {"intent": "second", "tool": "shell", "args": {"cmd": "cat f"}, "deps": [0],
+         "success_predicate": "prints"},
+    ]})
+    assert ok.status_code == 200, ok.text
+    for i in range(2):  # max_repairs=2 -> second failure of root.1 is terminal
+        claim = client.post("/claim", json={"agent_id": "t"}).json()
+        assert claim["node"]["id"] == "root.1"
+        client.post(f"/runs/{run_id}/nodes/root.1/result",
+                    json={"state": "FAILED", "hint": f"boom {i}"})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "ESCALATED"
+    assert run["nodes"]["root.2"]["state"] == "BLOCKED"      # dep-consumer, per cascade
+    assert run["nodes"]["root"]["state"] == "ESCALATED"      # collapsed dead parent
+    assert "children failed" in run["nodes"]["root"]["hint"]
+    assert run["active"] is False                            # nothing claimable, run over
+
+
+def test_escalated_child_does_not_collapse_live_siblings(client):
+    """Collapse only fires when EVERY child is terminal — an unclaimed/PENDING
+    sibling means the branch is still alive, so the parent stays WAITING."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "big task"}]})
+    run_id = r.json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "first", "tool": "write_file", "args": {"path": "f", "content": "c"},
+         "success_predicate": "exists"},
+        {"intent": "second", "tool": "shell", "args": {"cmd": "echo hi"},
+         "success_predicate": "prints"},
+    ]})
+    for i in range(2):  # max_repairs=2 -> second failure of root.1 is terminal
+        claim = client.post("/claim", json={"agent_id": "t"}).json()
+        assert claim["node"]["id"] == "root.1"
+        client.post(f"/runs/{run_id}/nodes/root.1/result",
+                    json={"state": "FAILED", "hint": f"boom {i}"})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "ESCALATED"
+    assert run["nodes"]["root.2"]["state"] == "PENDING"      # untouched, still alive
+    assert run["nodes"]["root"]["state"] == "WAITING"        # not collapsed
+    assert run["active"] is True
+
+
+def test_writer_survives_dead_branch_and_head_answers(client):
+    """A sink downstream of a dead branch must NOT be blocked: it is claimable
+    once its deps are terminal (resilient) and answers from the material that
+    survived — the head settles partial-DONE with that text instead of going up
+    ESCALATED and empty (measured live: 4/5 runs ended answerless)."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "big task"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "branch", "tool": None, "deps": []},
+        {"intent": "answer from the branch", "tool": "llm", "deps": [0],
+         "success_predicate": "covers"},
+        {"intent": "deliver the answer", "tool": "write_file", "deps": [1],
+         "args": {"path": "out.md", "content": {"$from": "root.2", "path": "text"}},
+         "success_predicate": "file exists"},
+    ]})
+    assert ok.status_code == 200, ok.text
+    ok = client.post(f"/runs/{run_id}/nodes/root.1/decompose", json={"children": [
+        {"intent": "first", "tool": "write_file", "args": {"path": "f", "content": "c"},
+         "success_predicate": "exists"},
+        {"intent": "second", "tool": "shell", "args": {"cmd": "cat f"},
+         "success_predicate": "prints"},
+    ]})
+    assert ok.status_code == 200, ok.text
+    for i in range(4):   # two leaves, max_repairs=2 failures each -> both escalate
+        claim = client.post("/claim", json={"agent_id": "t"}).json()
+        assert claim["node"]["id"] in ("root.1.1", "root.1.2")
+        client.post(f"/runs/{run_id}/nodes/{claim['node']['id']}/result",
+                    json={"state": "FAILED", "hint": f"boom {i}"})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "ESCALATED"   # collapsed dead branch
+    assert run["nodes"]["root.2"]["state"] == "PENDING"     # writer NOT blocked
+    assert run["nodes"]["root.3"]["state"] == "PENDING"     # $from deliverable too
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["node"]["id"] == "root.2"                  # ready on terminal deps
+    client.post(f"/runs/{run_id}/nodes/root.2/result",
+                json={"state": "DONE", "result": {"text": "partial answer"}})
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["node"]["id"] == "root.3"                  # deliverable still runs
+    client.post(f"/runs/{run_id}/nodes/root.3/result",
+                json={"state": "DONE", "result": {"bytes": 14}})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root"]["state"] == "DONE"          # partial settle
+    assert run["nodes"]["root"]["result"]["text"] == "partial answer"
+    assert run["active"] is False
+    assert client.post("/claim", json={"agent_id": "t"}).json()["node"] is None
+
+
+def test_settle_path_collapses_parent_when_last_sibling_finishes(client):
+    """Collapse must also fire on the DONE path: if the last live sibling finishes
+    AFTER another sibling already failed, the parent otherwise stays WAITING with
+    all-terminal kids and the run never ends (measured live)."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "big task"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "fails", "tool": "shell", "args": {"cmd": "false"},
+         "success_predicate": "runs"},
+        {"intent": "succeeds last", "tool": "shell", "args": {"cmd": "true"},
+         "success_predicate": "runs"},
+    ]})
+    assert ok.status_code == 200, ok.text
+    for i in range(2):   # root.1 fails to terminal while root.2 is still live
+        claim = client.post("/claim", json={"agent_id": "t"}).json()
+        assert claim["node"]["id"] == "root.1"
+        client.post(f"/runs/{run_id}/nodes/root.1/result",
+                    json={"state": "FAILED", "hint": f"boom {i}"})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root"]["state"] == "WAITING"       # sibling alive: not yet
+    claim = client.post("/claim", json={"agent_id": "t"}).json()
+    assert claim["node"]["id"] == "root.2"
+    client.post(f"/runs/{run_id}/nodes/root.2/result",
+                json={"state": "DONE", "result": {"rc": 0}})
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root"]["state"] == "ESCALATED"     # collapse fired on settle
+    assert run["active"] is False
+
+
+def test_skills_registers_tool_and_holds_human_gate(client, monkeypatch):
+    """POST /skills validates the spec, has the sandbox write the module, then
+    re-syncs: the new tool lands in the registry as 'unvetted' so its first use
+    still shows the human an approval card."""
+    captured = {}
+
+    async def fake_post(path, payload):
+        captured.update(payload)
+        return {"created": payload["name"]}
+
+    async def fake_get(path):
+        return {"tools": {"count_lines": {"file": "count_lines.py",
+                                          "desc": "count file lines",
+                                          "required": ["path"]}}}
+
+    monkeypatch.setattr(core, "_sandbox_post", fake_post)
+    monkeypatch.setattr(core, "_sandbox_get", fake_get)
+    r = client.post("/skills", json={"name": "count_lines", "desc": "count file lines",
+                                     "required": ["path"], "cmd": "wc -l < {path}"})
+    assert r.status_code == 200, r.text
+    assert captured["name"] == "count_lines"
+    ent = client.get("/tools").json()["tools"]["count_lines"]
+    assert ent["desc"] == "count file lines" and ent["dynamic"] and ent["unvetted"]
+    # built-ins and garbage names are refused before the sandbox is asked
+    assert client.post("/skills", json={"name": "shell", "cmd": "x"}).status_code == 409
+    assert client.post("/skills", json={"name": "Bad Name!", "cmd": "x"}).status_code == 400
+
+
+def test_user_patch_re_arms_an_out_of_budget_run(client):
+    """The wall-clock budget counts from `created`: a user fix&retry on a
+    budget-terminated run died again within a second (9ea37d2e, twice). A
+    user patch on an out-of-budget run re-arms the clock."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "big task"}]})
+    run_id = r.json()["run_id"]
+    client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "first", "tool": "write_file", "args": {"path": "f", "content": "c"},
+         "success_predicate": "exists"},
+        {"intent": "second", "tool": "shell", "args": {"cmd": "echo hi"},
+         "success_predicate": "prints"},
+    ]})
+    client.post("/claim", json={"agent_id": "t"})     # root.1 RUNNING, root.2 PENDING
+    # wall-clock expiry; the next claim tick hands the run to the governor
+    core.RUNS[run_id]["created"] = time.time() - 9000
+    assert client.post("/claim", json={"agent_id": "t"}).json()["node"] is None
+    dead = client.get(f"/runs/{run_id}").json()
+    assert all("budget governor" in n["hint"] for n in dead["nodes"].values())
+    # user fix & retry: clock resets, work reopens — not another instant kill
+    r2 = client.post(f"/runs/{run_id}/patch", json={"ops": [
+        {"op": "retry_node", "node_id": "root.1"}, {"op": "retry_node", "node_id": "root.2"}]})
+    assert r2.status_code == 200, r2.text
+    run2 = client.get(f"/runs/{run_id}").json()
+    assert time.time() - core.RUNS[run_id]["created"] < 60          # re-armed
+    assert run2["nodes"]["root.1"]["state"] == "PENDING"
+    got = client.post("/claim", json={"agent_id": "t"}).json()["node"]
+    assert got is not None and got["id"] == "root.1"              # claimable again
 
 
 def test_decompose_validates_and_waits(client):
@@ -834,6 +1018,138 @@ def test_escalation_scopes_to_the_branch_and_recovery_rejoins(client):
         client.post("/claim", json={"agent_id": "t"})
         client.post(f"/runs/{run_id}/nodes/{nid}/result", json={"state": "DONE", "result": 1})
     assert client.get(f"/runs/{run_id}").json()["nodes"]["root"]["state"] == "DONE"
+
+
+def test_terminal_failure_refines_the_written_file_chain(client):
+    """A terminal failure whose error names a workspace file gets ONE
+    error-driven refinement: the content source re-synthesizes with the error
+    in hand, the write re-lands, the failed node re-runs behind the write.
+    Bounded: a second failure of the same node escalates for good."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "head"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "write the corrected contents of a.py", "tool": "llm",
+         "deps": [], "success_predicate": "ok"},
+        {"intent": "land it", "tool": "write_file", "deps": [0],
+         "success_predicate": "ok",
+         "args": {"path": "a.py", "content": {"$from": "root.1", "path": "text"}}},
+        {"intent": "run it", "tool": "shell", "deps": [1],
+         "success_predicate": "ok",
+         "args": {"cmd": "python a.py"}}]})
+    assert ok.status_code == 200, ok.text
+
+    def claim_report(state, **kw):
+        c = client.post("/claim", json={"agent_id": "t"}).json()
+        assert c["node"], "expected claimable work"
+        client.post(f"/runs/{run_id}/nodes/{c['node']['id']}/result",
+                    json={"state": state, **kw})
+        return c["node"]["id"]
+
+    assert claim_report("DONE", result={"text": "v1"}) == "root.1"
+    assert claim_report("DONE", result={"bytes": 3}) == "root.2"
+    err = ("predicate unmet: it works | rc=1 File \"/workspace/a.py\", "
+           "line 3: ModuleNotFoundError")
+    for _ in range(2):                      # max_repairs=2 -> terminal
+        assert claim_report("FAILED", hint=err) == "root.3"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "PENDING"      # author reopens
+    assert "run time" in run["nodes"]["root.1"]["hint"] and err in run["nodes"]["root.1"]["hint"]
+    assert run["nodes"]["root.2"]["state"] == "PENDING"      # write re-lands
+    assert run["nodes"]["root.3"]["state"] == "ESCALATED"    # retry DEFERRED
+    # the refined chain runs again in dep order
+    assert claim_report("DONE", result={"text": "v2"}) == "root.1"
+    assert claim_report("DONE", result={"bytes": 3}) == "root.2"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.3"]["state"] == "PENDING"      # re-run behind the fix
+    # second failure of the same node is terminal for good (loop bound)
+    for _ in range(2):
+        assert claim_report("FAILED", hint=err) == "root.3"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.3"]["state"] == "ESCALATED"
+    assert run["nodes"]["root.1"]["state"] == "DONE"          # not re-refined
+    assert run["nodes"]["root"]["result"]["text"] == "v2"     # head holds the fix
+    assert run["active"] is False
+
+
+def test_refine_never_cycles_when_the_runner_feeds_the_author(client):
+    """The runner's output is the sink's material (sink deps on the runner) —
+    an edge back from the write to the runner closed a cycle and deadlocked
+    the whole run (measured live: 1800s timeout, everything unclaimable).
+    The retry is deferred behind the write instead: no edges are touched."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "head"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "run it", "tool": "shell", "deps": [], "success_predicate": "ok",
+         "args": {"cmd": "python a.py"}},
+        {"intent": "write the corrected contents of a.py", "tool": "llm",
+         "deps": [0], "success_predicate": "ok"},
+        {"intent": "land it", "tool": "write_file", "deps": [1],
+         "success_predicate": "ok",
+         "args": {"path": "a.py", "content": {"$from": "root.2", "path": "text"}}}]})
+    assert ok.status_code == 200, ok.text
+
+    def claim_report(state, **kw):
+        c = client.post("/claim", json={"agent_id": "t"}).json()
+        assert c["node"], "expected claimable work — the run must not deadlock"
+        client.post(f"/runs/{run_id}/nodes/{c['node']['id']}/result",
+                    json={"state": state, **kw})
+        return c["node"]["id"]
+
+    err = "predicate unmet: it works | rc=1 File \"/workspace/a.py\": ImportError"
+    for _ in range(2):
+        assert claim_report("FAILED", hint=err) == "root.1"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "ESCALATED"    # deferred, not moved
+    assert run["nodes"]["root.1"]["deps"] == []              # NO edge added
+    assert run["nodes"]["root.2"]["state"] == "PENDING"      # author reopens
+    assert claim_report("DONE", result={"text": "v2"}) == "root.2"
+    assert claim_report("DONE", result={"bytes": 3}) == "root.3"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "PENDING"      # re-run behind the fix
+    assert claim_report("DONE", result={"rc": 0, "stdout": "42"}) == "root.1"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root"]["state"] == "DONE"
+    assert run["nodes"]["root"]["result"]["text"] == "v2"
+    assert run["active"] is False
+
+
+def test_predicate_echo_hint_never_refines_the_writer(client):
+    """The success predicate names every task path — 'identify failing tests in
+    bugfix-lab/analyze.py' triggered a rewrite and a working file became test
+    code (live T2). Only an execution ERROR tail (' | rc=…') may attribute a
+    failure to a file."""
+    r = client.post("/runs", json={"nodes": [{"id": "root", "intent": "head"}]})
+    run_id = r.json()["run_id"]
+    ok = client.post(f"/runs/{run_id}/nodes/root/decompose", json={"children": [
+        {"intent": "write the corrected contents of a.py", "tool": "llm",
+         "deps": [], "success_predicate": "ok"},
+        {"intent": "land it", "tool": "write_file", "deps": [0],
+         "success_predicate": "ok",
+         "args": {"path": "a.py", "content": {"$from": "root.1", "path": "text"}}},
+        {"intent": "check it", "tool": "shell", "deps": [1],
+         "success_predicate": "failing tests in a.py are identified",
+         "args": {"cmd": "grep x a.py"}}]})
+    assert ok.status_code == 200, ok.text
+
+    def claim_report(state, **kw):
+        c = client.post("/claim", json={"agent_id": "t"}).json()
+        assert c["node"], "expected claimable work"
+        client.post(f"/runs/{run_id}/nodes/{c['node']['id']}/result",
+                    json={"state": state, **kw})
+        return c["node"]["id"]
+
+    assert claim_report("DONE", result={"text": "v1"}) == "root.1"
+    assert claim_report("DONE", result={"bytes": 3}) == "root.2"
+    echo = "predicate unmet: failing tests in a.py are identified"
+    for _ in range(2):
+        assert claim_report("FAILED", hint=echo) == "root.3"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["nodes"]["root.1"]["state"] == "DONE"          # untouched
+    assert run["nodes"]["root.1"]["result"]["text"] == "v1"
+    assert run["nodes"]["root.2"]["state"] == "DONE"          # file not rewritten
+    assert run["nodes"]["root.3"]["state"] == "ESCALATED"     # honest failure
+    # same for an error tail that does not name the file
+    assert run["nodes"]["root"]["state"] == "DONE"            # partial settle
 
 
 def test_stale_report_does_not_spend_llm_budget(client):

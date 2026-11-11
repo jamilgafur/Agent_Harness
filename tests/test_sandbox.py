@@ -160,6 +160,31 @@ def test_dynamic_tool_discover_and_run(monkeypatch, tmp_path):
     assert r.status_code == 404
 
 
+def test_create_skill_writes_discovers_and_quotes(monkeypatch, tmp_path):
+    """A declarative skill spec becomes a real tool module: shell template with
+    shlex-quoted args, discovered by the normal sync path."""
+    monkeypatch.setattr(sb, "TOOLS_DIR", tmp_path / "tools")
+    monkeypatch.setattr(sb, "WORKSPACE", tmp_path)
+    from fastapi.testclient import TestClient
+    c = TestClient(sb.app)
+    r = c.post("/create_skill", json={"name": "count_lines", "desc": "count file lines",
+                                      "required": ["path"], "cmd": "wc -l < {path}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["tool"] == {"file": "count_lines.py", "desc": "count file lines",
+                                "required": ["path"]}
+    (tmp_path / "notes.txt").write_text("one\ntwo\nthree\n")
+    out = c.post("/run_tool", json={"name": "count_lines",
+                                    "args": {"path": "notes.txt with spaces"}}).json()
+    assert out["rc"] != 0                    # quoted as ONE arg: no such file -> rc 2…
+    out = c.post("/run_tool", json={"name": "count_lines",
+                                    "args": {"path": "notes.txt"}}).json()
+    assert out["rc"] == 0 and "3" in out["stdout"]
+    bad = c.post("/create_skill", json={"name": "Bad Name", "cmd": "echo"})
+    assert bad.status_code == 400
+    bad2 = c.post("/create_skill", json={"name": "ok_name", "cmd": "ls {noarg}"})
+    assert bad2.status_code == 400 and "noarg" in str(bad2.json())
+
+
 def test_confined_rejects_same_prefix_sibling_escape(tmp_path, monkeypatch):
     """../workspace_evil/x resolved outside WORKSPACE but passed the old
     startswith("/workspace") check (path-prefix bug)."""

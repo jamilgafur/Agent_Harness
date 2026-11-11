@@ -150,6 +150,15 @@ class ConstraintIn(BaseModel):
     constraints: list[str]
 
 
+class SkillIn(BaseModel):
+    """Declarative runtime skill: spec → sandbox writes tools/{name}.py (shell
+    template; {arg} placeholders). Custom python: drop a .py in the workspace."""
+    name: str
+    desc: str = ""
+    required: list[str] = []
+    cmd: str
+
+
 class AddedNode(BaseModel):
     intent: str
     parent: str = "root"

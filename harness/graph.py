@@ -193,11 +193,24 @@ def apply_patch(nodes: dict[str, Node], patch: Patch, known_tools: Iterable[str]
     return (None, verrs) if verrs else (trial, [])
 
 
-def ready_nodes(nodes: dict[str, Node]) -> list[Node]:
-    """Topologically-ready work: PENDING or REPAIRING, all deps DONE."""
-    return [n for n in nodes.values()
-            if n.state in (NodeState.PENDING, NodeState.REPAIRING)
-            and all(nodes[d].state == NodeState.DONE for d in n.deps)]
+_TERMINAL = (NodeState.DONE, NodeState.FAILED, NodeState.BLOCKED, NodeState.ESCALATED)
+
+
+def ready_nodes(nodes: dict[str, Node], resilient: Iterable[str] = ()) -> list[Node]:
+    """Topologically-ready work: PENDING or REPAIRING, all deps DONE.
+    `resilient` ids (the writers) are ready once every dep is TERMINAL — they
+    answer from whatever material survived a dead sibling; a strict all-DONE
+    gate left them PENDING-but-unclaimable and the run never ended."""
+    out = []
+    for n in nodes.values():
+        if n.state not in (NodeState.PENDING, NodeState.REPAIRING):
+            continue
+        if all(nodes[d].state == NodeState.DONE for d in n.deps):
+            out.append(n)
+        elif n.id in set(resilient) \
+                and all(nodes[d].state in _TERMINAL for d in n.deps):
+            out.append(n)
+    return out
 
 
 def inputs_for(nodes: dict[str, Node], node: Node) -> dict[str, Any]:

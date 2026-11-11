@@ -21,9 +21,10 @@ Open items, roughly ordered by value. Shipped history: `CHANGELOG.md` and
 - **Loop bodies as multi-node subgraphs** — loops are requeue-per-iteration
   today (`shortcut:` comment in `core.report`); unroll when a body needs
   several nodes.
-- **Repair creativity** — on the last repair attempt, convert a failing tool
-  node into an abstract node so the next claim re-plans instead of
-  re-executing identical args (useless for "make the failing tests pass").
+- **Repair creativity** — error-driven refinement now re-synthesizes the file
+  a runtime traceback names (shipped). What remains: on the last repair attempt
+  of a *predicate* failure, convert the failing tool node into an abstract node
+  so the next claim re-plans instead of re-executing identical args.
 - **Autosizer upgrade** — queue-depth + VRAM-aware agent sizing (today:
   ollama-ping latency bands).
 - **Paper metrics not yet implemented**: EWC (needs learned edge weights),

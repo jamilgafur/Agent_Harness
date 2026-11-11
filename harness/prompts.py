@@ -30,6 +30,16 @@ looks like. Be specific to this exact task; no generic advice.
 Task: {task}""",
     "judge": """You judge whether a tool execution satisfied the success predicate.
 Reply with JSON only: {"ok": true|false, "why": "short reason"}""",
+    "repair": """The tool call below failed; write its corrected replacement.
+args keys must match the tool's required names exactly. Fix what the failure says was
+wrong, and make the success_predicate checkable from the execution result itself.""",
+    "debate": """You are one of several agents answering the same task. Your latest answer
+and the rivals' answers follow. Keep the strongest specifics found anywhere, adopt any
+better grounded points, fix what is weak or wrong, and reply with ONLY your improved
+answer, in the same format as before — no commentary, no meta-discussion.""",
+    "vote": """You pick the single best candidate for the task shown. Judge grounding in
+the material, specificity, coverage, and fit to the task. Reply with JSON only:
+{"choice": <0-based candidate index>, "why": "short reason"}""",
 }
 
 DEFAULT_PARAMS: dict[str, Any] = {
@@ -39,6 +49,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "gather_tools": ["web_search", "http_fetch"],
     "sink_tool": "llm",
     "max_results": 8,
+    # ensemble coordination (see ensemble.py): off by default — with samples=1 and
+    # debate_rounds=0 every LLM call path is exactly the pre-ensemble behavior
+    "samples": 1,        # >1: K proposals per llm-writer node & decompose; K-judge panel
+    "debate_rounds": 0,  # >0: rounds of rival-aware revision before the vote
 }
 
 PROMPT_KEYS = tuple(DEFAULT_PROMPTS)
@@ -51,6 +65,8 @@ PARAM_SPEC: dict[str, tuple] = {
     "gather_tools": (list,),
     "sink_tool": (str,),
     "max_results": (int, 3, 10),
+    "samples": (int, 1, 5),
+    "debate_rounds": (int, 0, 3),
 }
 
 

@@ -1,4 +1,5 @@
 """Agent-side material formatting + upward traversal for the virtual `llm` tool."""
+from harness import core
 from harness.agent import GATHER_TOOLS as GATHER
 from harness.agent import SINK_TOOL as SINK
 from harness.agent import (
@@ -34,6 +35,55 @@ def test_llm_ok_requires_substantive_text():
     assert _llm_ok("Structured pruning removes entire channels or filters from a network.")
 
 
+def test_llm_ok_rejects_failure_cards_and_footer_padding():
+    # a whole-answer "[Missing ...]" card is the no-material failure signal, not
+    # an answer — accepting it wrote "[Missing ...]" chains into run heads
+    assert not _llm_ok("[Missing specific recipe details and instructions]")
+    assert not _llm_ok("(no material was gathered)")
+    # a Sources footer must not pad a thin body past the length bar
+    assert not _llm_ok("It was built in 1876.\n\nSources:\n- https://x.example/page")
+    assert _llm_ok("Built in 1876 in Valdara by Brandt with a 1.2 m mirror."
+                   "\n\nSources:\n- https://x.example/page")
+
+
+def test_writer_retry_sees_why_it_was_rejected():
+    """A REPAIRING writer node must carry the rejection into its material —
+    an oblivious retry just repeats the same thin answer."""
+    captured = {}
+
+    class EchoLlm:
+        calls = 0
+
+        def chat(self, sys_p, user_p, **kw):
+            captured["prompt"] = user_p
+            return "A substantive grounded answer with specific facts about the topic."
+
+    class Http:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, json=None):
+            self.posts.append((path, json))
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {}
+
+            return R()
+
+    a = object.__new__(Agent)
+    a.llm, a.http, a.phase = EchoLlm(), Http(), "x"
+    a.handle({"run_id": "r", "inputs": {"root.1": {"text": "material here"}}, "max_depth": 17,
+              "tools": {}, "constraints": [], "context": {}, "prompts": {}, "params": {},
+              "node": {"id": "root.1.2", "parent": "root.1", "intent": "write about x",
+                       "tool": "llm", "depth": 2, "attempts": 2,
+                       "hint": "synthesis produced an empty/thin answer"}})
+    assert "Previous attempt rejected: synthesis produced an empty/thin answer" \
+        in captured["prompt"]
+
+
 def test_sources_footers_dedupe_and_reach_into_aggregates():
     leaf = {"results": [{"url": "https://a", "page_text": "t"},
                         {"url": "https://a", "page_text": "t"},
@@ -52,6 +102,198 @@ def test_sources_recover_links_from_climbing_branch_summaries():
               "from": "root.1.4"}
     got = _sources({"root.1": branch, "root.2": {"text": "no links", "from": "root.2.2"}})
     assert "- https://a/p" in got and "- https://b/q" in got
+
+
+def test_tool_repair_rewrites_args_and_predicate_from_the_hint():
+    """A repair retry must RE-DERIVE args: re-executing identical args can never
+    fix a failed tool call (measured: three byte-identical attempts, escalation)."""
+    captured = {}
+
+    class FixLlm:
+        calls = 0
+
+        def chat_json(self, sys_p, ask, **kw):
+            FixLlm.calls += 1
+            captured["ask"] = ask
+            return {"args": {"cmd": "cat f"},
+                    "success_predicate": "output contains the record"}
+
+    class Http:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, json=None):
+            self.posts.append((path, json))
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"status": "done", "result": {"rc": 0, "stdout": "the record"}}
+
+            return R()
+
+    a = object.__new__(Agent)
+    a.llm, a.http, a.phase = FixLlm(), Http(), "x"
+    a.handle({"run_id": "r", "inputs": {}, "max_depth": 17, "constraints": [],
+              "context": {}, "prompts": {}, "params": {},
+              "tools": {"shell": {"required": ["cmd"]}},
+              "node": {"id": "root.1", "parent": "root", "intent": "show the record",
+                       "tool": "shell", "depth": 1, "attempts": 1,
+                       "args": {"cmd": "grep record f2"},       # the args that failed
+                       "hint": "predicate unmet: no output",
+                       "success_predicate": "shows"}})
+    execs = [p for p in a.http.posts if p[0].endswith("/exec")]
+    assert execs and execs[0][1]["args"] == {"cmd": "cat f"}   # rewritten, not replayed
+    assert "predicate unmet: no output" in captured["ask"]     # the hint drives the fix
+    assert FixLlm.calls == 1
+    # first attempt (no hint) must not spend an LLM call on repair
+    b = object.__new__(Agent)
+    b.llm, b.http, b.phase = FixLlm(), Http(), "x"
+    b.handle({"run_id": "r", "inputs": {}, "max_depth": 17, "constraints": [],
+              "context": {}, "prompts": {}, "params": {},
+              "tools": {"shell": {"required": ["cmd"]}},
+              "node": {"id": "root.2", "parent": "root", "intent": "show",
+                       "tool": "shell", "depth": 1, "attempts": 1,
+                       "args": {"cmd": "cat f"}, "hint": "",
+                       "success_predicate": "shows"}})
+    assert FixLlm.calls == 1
+    # a broken repair generation must not stall the node: args replay, work happens
+    class BoomLlm:
+        calls = 0
+
+        def chat_json(self, *a, **k):
+            raise RuntimeError("llm hiccup")
+
+    c = object.__new__(Agent)
+    c.llm, c.http, c.phase = BoomLlm(), Http(), "x"
+    c.handle({"run_id": "r", "inputs": {}, "max_depth": 17, "constraints": [],
+              "context": {}, "prompts": {}, "params": {},
+              "tools": {"shell": {"required": ["cmd"]}},
+              "node": {"id": "root.3", "parent": "root", "intent": "show",
+                       "tool": "shell", "depth": 1, "attempts": 1,
+                       "args": {"cmd": "cat f"}, "hint": "predicate unmet: x",
+                       "success_predicate": "shows"}})
+    execs = [p for p in c.http.posts if p[0].endswith("/exec")]
+    assert execs and execs[0][1]["args"] == {"cmd": "cat f"}   # replayed, not dropped
+
+
+def test_crud_tool_registry_checks_judge_without_the_llm():
+    """write_file/read_file/list_dir carry a `check` result path, so state
+    predicates ("the file contains …") are decided from the result deterministically
+    — an LLM judge seeing {bytes: N} rejected TRULY written files as unmet."""
+    class Boom:
+        calls = 0
+
+        def chat_json(self, *a, **k):
+            Boom.calls += 1
+            return {"ok": True}
+
+    a = object.__new__(Agent)
+    a.llm = Boom()
+    node = {"tool": "write_file", "intent": "write f",
+            "success_predicate": "the file contains the payload"}
+    assert a.judge(node, {"bytes": 42}, {}, {}, core.TOOLS) is True
+    assert a.judge(node, {"bytes": 0}, {}, {}, core.TOOLS) is False
+    assert Boom.calls == 0
+    assert core.TOOLS["write_file"].get("check") == "bytes"
+    assert core.TOOLS["read_file"].get("check") == "content"
+    assert core.TOOLS["list_dir"].get("check") == "entries"
+
+
+def test_failed_shell_hint_carries_stderr_for_repair():
+    """Repair re-derives args from the failure hint — if the hint drops stderr
+    the model regenerates the same invented script every attempt (live T3:
+    'python analyze_sales.py' x3 while 'can't open file' never surfaced)."""
+    class Llm:
+        calls = 0
+
+        def chat_json(self, *a, **k):
+            return {"ok": True}
+
+    class Http:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, json=None):
+            self.posts.append((path, json))
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"status": "done",
+                            "result": {"rc": 2,
+                                       "stderr": "can't open file 'analyze_sales.py'"}}
+
+            return R()
+
+    a = object.__new__(Agent)
+    a.llm, a.http, a.phase = Llm(), Http(), "x"
+    a.handle({"run_id": "r", "inputs": {}, "max_depth": 17, "constraints": [],
+              "context": {}, "prompts": {}, "params": {},
+              "tools": {"shell": {"required": ["cmd"]}},
+              "node": {"id": "root.1", "parent": "root", "intent": "total revenue",
+                       "tool": "shell", "depth": 1, "attempts": 1,
+                       "args": {"cmd": "python analyze_sales.py"},
+                       "success_predicate": "prints the total"}})
+    reports = [p for p in a.http.posts if p[0].endswith("/result")]
+    assert reports and "can't open file 'analyze_sales.py'" in \
+        str(reports[-1][1].get("hint", ""))
+
+
+def test_write_payload_lands_the_code_not_the_analysis():
+    """Live T2: the corrected file sat inside ```python fences while the write
+    carried analysis prose; the judge refused it and the bug survived. A .py
+    write must land as code — the text if it parses, else the largest fenced
+    block that does. Prose without code stays untouched (the judge refuses it)."""
+    from harness.agent.writing import _write_payload
+    prose = ("To identify and correct the bugs, here is the analysis.\n\n"
+             "**Updated Code:**\n```python\ndef mean(data):\n"
+             "    return sum(data) / len(data)\n```\n\n"
+             "The updated analyze.py should look like this:\n```python\n"
+             "def mean(data):\n    return sum(data) / len(data)\n\n\n"
+             "def median(data):\n    xs = sorted(data)\n    n = len(xs)\n"
+             "    mid = n // 2\n"
+             "    return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2\n```\n")
+    node = {"tool": "write_file",
+            "args": {"path": "bugfix-lab/analyze.py",
+                     "content": {"$from": "root.4.2", "path": "text"}}}
+    out = _write_payload(node, {"root.4.2": {"text": prose}})
+    content = out["args"]["content"]
+    assert "def median" in content and "```" not in content   # the complete file
+    assert "analysis" not in content
+    # plain-text content is bound, and code that already parses is left alone
+    good = {"tool": "write_file", "args": {"path": "a.py", "content": "x = 1\n"}}
+    assert _write_payload(good, {})["args"]["content"] == "x = 1\n"
+    # prose without any code block cannot be fixed up — left for the judge to refuse
+    bad = {"tool": "write_file", "args": {"path": "a.py",
+                                          "content": "updated code in a.py"}}
+    assert _write_payload(bad, {})["args"]["content"] == "updated code in a.py"
+    # non-code targets keep their prose (a report is prose)
+    rep = {"tool": "write_file", "args": {"path": "r.md", "content": prose}}
+    assert _write_payload(rep, {})["args"]["content"] == prose
+
+
+def test_judge_never_passes_broken_python_writes():
+    """A *.py write whose content is not valid Python must fail the judge even
+    when bytes landed: live T2 shipped a status line over source and pytest died
+    on it (rc=2) while the bytes check said DONE. Covers plain content and the
+    $from write-back resolved from dep inputs."""
+    a = object.__new__(Agent)
+    node = {"tool": "write_file", "intent": "fix it", "success_predicate": "fixed",
+            "args": {"path": "bugfix-lab/analyze.py",
+                     "content": "updated code in bugfix-lab/analyze.py"}}
+    assert a.judge(node, {"bytes": 36}, {}, {}, core.TOOLS) is False
+    node["args"]["content"] = "def mean(v):\n    return sum(v) / len(v)\n"
+    assert a.judge(node, {"bytes": 40}, {}, {}, core.TOOLS) is True
+    node["args"]["content"] = "fixed_content"      # parses as a lone Expr — not a file
+    assert a.judge(node, {"bytes": 13}, {}, {}, core.TOOLS) is False
+    node["args"]["content"] = {"$from": "root.4", "path": "text"}
+    assert a.judge(node, {"bytes": 40}, {}, {}, core.TOOLS,
+                   inputs={"root.4": {"text": "the fix is done"}}) is False
+    assert a.judge(node, {"bytes": 40}, {}, {}, core.TOOLS,
+                   inputs={"root.4": {"text": "def mean(v):\n    return 0\n"}}) is True
 
 
 def test_judge_gather_tools_is_deterministic_and_never_calls_the_llm():
@@ -190,7 +432,45 @@ def test_head_writer_assembles_sections_from_branch_summaries():
     assert len(a.llm.replies) == 2         # intro + outro only: body is not re-generated
 
 
-def test_branch_writer_and_thin_head_use_plain_synthesis():
+def test_head_writer_carries_tool_output_sections_not_just_sink_text():
+    """Live T5: every dep was a tool (shell stdout / read_file content), the
+    assembly collected only sibling-sink TEXT, found zero sections, and the
+    answer collapsed to the model's first sentence — 2 of 3 requested facts
+    dropped though they sat verbatim in the dep results."""
+    a = object.__new__(Agent)
+    a.http = _RunHttp()
+    a.llm = _WriterLlm()
+    inputs = {
+        "root.1": {"rc": 0, "stdout": "2031\nHalden Voss\n"},
+        "root.2": {"rc": 0, "stdout": "2033\nPetra Lund\n"},
+        "root.3": {"bytes": 12},                     # a write result: no text, skipped
+    }
+    t = a._write_answer("r", {"id": "root.4", "parent": "root", "intent": "sink"},
+                        inputs, "MATERIAL", [])
+    assert "## branch one intent\n\n2031\nHalden Voss" in t
+    assert "## branch two intent\n\n2033\nPetra Lund" in t
+    assert len(a.llm.replies) == 2                   # assembled, not re-generated
+
+
+def test_synthesis_carries_the_failure_hint_to_the_author():
+    """Error-driven refinement only works if the author SEES the runtime error
+    of the file its previous output produced."""
+    class Capturing(_WriterLlm):
+        pass
+
+    a = object.__new__(Agent)
+    a.http = _RunHttp()
+    a.llm = Capturing()
+    t = a._write_answer("r", {"id": "root.1.3", "parent": "root.1",
+                              "intent": "write the corrected contents of a.py",
+                              "hint": "the file produced from your previous output "
+                                      "failed at run time: ModuleNotFoundError: pandas"},
+                        {"root.1.2": {"text": "material"}}, "MATERIAL", [])
+    assert t == "GENERIC ANSWER."
+    assert "ModuleNotFoundError: pandas" in a.llm.replies[0]
+
+
+def test_branch_writer_and_empty_head_use_plain_synthesis():
     a = object.__new__(Agent)
     a.llm = _WriterLlm()          # replies beyond the first two => "GENERIC ANSWER."
     t = a._write_answer("r", {"id": "root.1.2", "parent": "root.1", "intent": "t"},
@@ -201,9 +481,20 @@ def test_branch_writer_and_thin_head_use_plain_synthesis():
     a2 = object.__new__(Agent)
     a2.http = _RunHttp()
     a2.llm = _WriterLlm()
+    # zero material -> the model's single chat call is all there is
     t2 = a2._write_answer("r", {"id": "root.4", "parent": "root", "intent": "t"},
+                          {"root.1": {"bytes": 3}}, "MATERIAL", [])
+    assert t2 == "GENERIC ANSWER."
+    # ONE section still assembles verbatim: regenerating paraphrased away a
+    # requested fact (live T5: the lone read_file dep held 'Petra Lund' and the
+    # chat answer dropped it) — the funnel drops nothing
+    a3 = object.__new__(Agent)
+    a3.http = _RunHttp()
+    a3.llm = _WriterLlm()
+    t3 = a3._write_answer("r", {"id": "root.4", "parent": "root", "intent": "t"},
                           {"root.1": {"text": "only one section"}}, "MATERIAL", [])
-    assert t2 == "GENERIC ANSWER."        # <2 sections: falls back to a single chat call
+    assert "## branch one intent\n\nonly one section" in t3
+    assert t3.startswith("# the run question")
 
 
 def _search(i):
@@ -223,14 +514,419 @@ def test_force_synthesis_rewires_misplaced_sink_and_breaks_back_edges():
     s2 = dict(_search(2))
     s2["deps"] = [1]                         # wrongly downstream of the sink
     kids = _force_synthesis([_search(1), llm, s2], "task")
-    assert kids[2]["deps"] == []                   # back-edge to sink removed
-    assert kids[1]["deps"] == [0, 2]               # sink now depends on every sibling
+    assert [c["tool"] for c in kids] == ["web_search", "web_search", "llm"]  # sink last
+    assert kids[1]["deps"] == []                   # back-edge to the sink removed
+    assert kids[2]["deps"] == [0, 1]               # sink depends on every sibling
 
 
-def test_force_synthesis_leaves_task_shapes_alone():
+def test_ground_on_local_tasks_reads_the_named_file():
+    """A task naming a local file must ground onto a path-taking gatherer —
+    web queries like 'Extract total revenue' return nothing usable (live T3)."""
+    from harness.agent.planning import _ground_on
+    tools = {"web_search": {"required": ["query"], "ground": {"query": "{intent}"}},
+             "read_file": {"required": ["path"], "ground": {"path": "{path}"}}}
+    tool, args = _ground_on(tools, ("web_search",),
+                            "Analyze the sales data in data-lab/sales.csv and "
+                            "write a summary report to data-lab/report.md",
+                            "Extract total revenue")
+    assert tool == "read_file" and args == {"path": "data-lab/sales.csv"}
+    tool, args = _ground_on(tools, ("web_search",), "tell me about pruning",
+                            "find primary sources")
+    assert tool == "web_search" and args == {"query": "find primary sources"}
+
+
+def test_named_output_sees_deliverables_not_mutation_targets():
+    from harness.agent.planning import _mutation_targets, _named_output
+    assert _named_output("Analyze data-lab/sales.csv and write a summary "
+                         "report to data-lab/report.md") == "data-lab/report.md"
+    assert _named_output("fix the bugs in bugfix-lab/analyze.py") == ""   # mutation
+    assert _mutation_targets("The tests are failing. Find and fix the bug(s) in "
+                             "bugfix-lab/analyze.py so the suite passes.") \
+        == ["bugfix-lab/analyze.py"]
+    assert _mutation_targets("Analyze the sales data in data-lab/sales.csv and "
+                             "write a report to data-lab/report.md.") == []
+    assert _mutation_targets("show the correct output in results.txt") == []
+    # 'contents of <path>' is only a deliverable after 'write' — summarizing or
+    # reading a file's contents must never mark it for rewriting
+    assert _named_output("write the corrected contents of bugfix-lab/analyze.py") \
+        == "bugfix-lab/analyze.py"
+    assert _named_output("summarize the contents of data-lab/sales.csv") == ""
+    assert _named_output("read the contents of data-lab/sales.csv") == ""
+
+
+def test_shape_children_adds_a_mutation_child_when_the_plan_has_none():
+    """'Fix X' without a child that writes X never fixes anything (live T2: the
+    bug survived because the plan only ran tests). The top-up child stays
+    abstract — the sub-plan supplies the real corrected content."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    out = {"children": [
+        {"intent": "run the tests", "tool": "shell",
+         "args": {"cmd": "pytest bugfix-lab"}, "deps": [], "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Find and fix the bug(s) in "
+                                               "bugfix-lab/analyze.py"},
+                               {"shell": {"required": ["cmd"]},
+                                "write_file": {"required": ["path", "content"]}},
+                               resolve_params({}))
+    kids = shaped["children"]
+    fixers = [c for c in kids if "bugfix-lab/analyze.py" in c["intent"]
+              and c.get("tool") is None]
+    assert len(fixers) == 1                    # abstract: content comes from a sub-plan
+    # a READ of the path is not a write — live T2: the top-up was skipped because
+    # a read_file child carried the path in its args and the bug survived
+    out3 = {"children": [
+        {"intent": "locate the failing test", "tool": "read_file",
+         "args": {"path": "bugfix-lab/analyze.py"}, "deps": [],
+         "success_predicate": "shows the file"},
+        {"intent": "run the tests", "tool": "shell",
+         "args": {"cmd": "pytest bugfix-lab"}, "deps": [], "success_predicate": "ok"}]}
+    shaped3 = a._shape_children(out3, {"id": "root", "depth": 0,
+                                       "intent": "Find and fix the bug(s) in "
+                                                 "bugfix-lab/analyze.py"},
+                                {"shell": {"required": ["cmd"]},
+                                 "write_file": {"required": ["path", "content"]},
+                                 "read_file": {"required": ["path"]}},
+                                resolve_params({}))
+    assert len([c for c in shaped3["children"]
+                if c.get("tool") is None and "bugfix-lab/analyze.py" in c["intent"]]) == 1
+    # a plan that already writes the file is left alone
+    out2 = {"children": [
+        {"intent": "fix it", "tool": "write_file",
+         "args": {"path": "bugfix-lab/analyze.py", "content": "def mean(d): ..."},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped2 = a._shape_children(out2, {"id": "root", "depth": 0,
+                                       "intent": "Fix the bug(s) in bugfix-lab/analyze.py"},
+                                {"shell": {"required": ["cmd"]},
+                                 "write_file": {"required": ["path", "content"]}},
+                                resolve_params({}))
+    assert not [c for c in shaped2["children"] if c.get("tool") is None]
+
+
+def test_shape_children_writes_the_named_output_from_the_sink():
+    """An intent promising a file ('write a report to X') must plan the write:
+    the sink's text becomes the file content via a $from binding (live T3 left
+    the deliverable nonexistent while computing the answer)."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    out = {"children": [
+        {"intent": "load the data", "tool": "read_file",
+         "args": {"path": "data-lab/sales.csv"}, "deps": [], "success_predicate": "ok"},
+        {"intent": "write the report", "tool": "llm", "deps": [0],
+         "success_predicate": "covers"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Analyze data-lab/sales.csv and write "
+                                               "a summary report to data-lab/report.md"},
+                               {"read_file": {"required": ["path"]},
+                                "write_file": {"required": ["path", "content"]}},
+                               resolve_params({}))
+    kids = shaped["children"]
+    writes = [c for c in kids if c.get("tool") == "write_file"]
+    assert len(writes) == 1
+    w = writes[0]
+    assert w["args"]["path"] == "data-lab/report.md"
+    assert w["args"]["content"] == {"$from": "root.2", "path": "text"}   # the sink
+    assert w["deps"] == [1]                                             # after the sink
+
+
+def test_shape_children_reads_a_named_input_file_whole():
+    """A task naming a local input file needs a child that reads it whole: live
+    T5 planned only 'grep X | awk' field guesses, the sink saw nothing but the
+    guessed fields and answered without any of the facts."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    out = {"children": [
+        {"intent": "extract the year", "tool": "shell",
+         "args": {"cmd": "grep Nettlebrook data-lab/facts.txt | awk '{print $4}'"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Read data-lab/facts.txt and answer "
+                                               "three things"}, tools, resolve_params({}))
+    readers = [c for c in shaped["children"]
+               if (c.get("args") or {}).get("path") == "data-lab/facts.txt"
+               and c.get("tool") == "read_file"]
+    assert len(readers) == 1
+    # a plan that already reads the file is left alone...
+    out2 = {"children": [
+        {"intent": "read it", "tool": "read_file",
+         "args": {"path": "data-lab/facts.txt"}, "deps": [], "success_predicate": "ok"}]}
+    shaped2 = a._shape_children(out2, {"id": "root", "depth": 0,
+                                       "intent": "Read data-lab/facts.txt"}, tools,
+                                resolve_params({}))
+    assert len([c for c in shaped2["children"] if c.get("tool") == "read_file"]) == 1
+    # ...and the deliverable is never READ back (it does not exist yet) — its
+    # write-back child still carries the path, that is the point of the task
+    out3 = {"children": [
+        {"intent": "compute", "tool": "shell", "args": {"cmd": "true"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped3 = a._shape_children(out3, {"id": "root", "depth": 0,
+                                       "intent": "Analyze data-lab/sales.csv and write "
+                                                 "a report to data-lab/report.md"},
+                                tools, resolve_params({}))
+    assert not [c for c in shaped3["children"]
+                if c.get("tool") == "read_file"
+                and (c.get("args") or {}).get("path") == "data-lab/report.md"]
+    assert any(c.get("tool") == "write_file"
+               and (c.get("args") or {}).get("path") == "data-lab/report.md"
+               for c in shaped3["children"])
+
+
+def test_fake_writes_are_dropped_and_top_ups_fire():
+    """A write whose content is the task echo or an unfilled template is not
+    content: live T2 wrote instruction prose over source (bug marker gone, file
+    broken), live T3 wrote '{{total_revenue}}' into the deliverable. Dropped —
+    so the mutation top-up and the sink-bound write-back plan real writes."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    intent2 = ("Fix the identified bug(s) in bugfix-lab/analyze.py and update "
+               "the file with the changes")
+    out = {"children": [
+        {"intent": intent2, "tool": "write_file",
+         "args": {"path": "bugfix-lab/analyze.py", "content": intent2},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0, "intent": intent2},
+                               tools, resolve_params({}))
+    kids = shaped["children"]
+    assert not [c for c in kids if c.get("tool") == "write_file"]   # echo dropped
+    assert any(c.get("tool") is None and "bugfix-lab/analyze.py" in c["intent"]
+               for c in kids)                                       # fix top-up fires
+    out2 = {"children": [
+        {"intent": "Write summary report to report.md", "tool": "write_file",
+         "args": {"path": "data-lab/report.md",
+                  "content": "Total Revenue: {{total_revenue}}"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped2 = a._shape_children(out2, {"id": "root", "depth": 0,
+                                       "intent": "Analyze data-lab/sales.csv and "
+                                                 "write a report to data-lab/report.md"},
+                                tools, resolve_params({}))
+    kids2 = shaped2["children"]
+    writes = [c for c in kids2 if c.get("tool") == "write_file"]
+    assert len(writes) == 1                     # template gone, sink-bound write back
+    assert writes[0]["args"]["content"] == {"$from": "root.2", "path": "text"}
+    # a *.py write that is not valid Python is not content either (live T2 wrote
+    # the status line 'updated code in bugfix-lab/analyze.py' over the source)
+    intent3 = "Fix the bug in bugfix-lab/analyze.py"
+    out3 = {"children": [
+        {"intent": intent3, "tool": "write_file",
+         "args": {"path": "bugfix-lab/analyze.py",
+                  "content": "updated code in bugfix-lab/analyze.py"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped3 = a._shape_children(out3, {"id": "root", "depth": 0, "intent": intent3},
+                                tools, resolve_params({}))
+    assert not [c for c in shaped3["children"] if c.get("tool") == "write_file"]
+    assert any(c.get("tool") is None and "bugfix-lab/analyze.py" in c["intent"]
+               for c in shaped3["children"])
+    # a bare placeholder word PARSES as Python (lone Expr) but is not a file —
+    # live T2 shipped literally 'fixed_content' into analyze.py
+    out4 = {"children": [
+        {"intent": intent3, "tool": "write_file",
+         "args": {"path": "bugfix-lab/analyze.py", "content": "fixed_content"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped4 = a._shape_children(out4, {"id": "root", "depth": 0, "intent": intent3},
+                                tools, resolve_params({}))
+    assert not [c for c in shaped4["children"] if c.get("tool") == "write_file"]
+    assert any(c.get("tool") is None for c in shaped4["children"])
+
+
+def test_invented_script_shell_splits_into_write_then_run():
+    """A shell running a script nobody creates never runs (live T3: the model
+    regenerated 'python analyze_sales.py' 3x per child while 'can't open file'
+    stared it in the face). Split it: the child becomes the script write, the
+    run is appended after it and depends on it."""
+    from harness.prompts import resolve_params
+    from harness.core import _build_children
+    from harness.models import Node
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    out = {"children": [
+        {"intent": "Extract total revenue", "tool": "shell",
+         "args": {"cmd": "python analyze_sales.py --csv data-lab/sales.csv --total"},
+         "deps": [], "success_predicate": "prints"},
+        {"intent": "Identify top product", "tool": "shell",
+         "args": {"cmd": "python analyze_sales.py --top"},
+         "deps": [], "success_predicate": "prints"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Analyze data-lab/sales.csv and "
+                                               "write a report to data-lab/report.md"},
+                               tools, resolve_params({}))
+    kids = shaped["children"]
+    writes = [c for c in kids if c.get("tool") is None
+              and "analyze_sales.py" in c["intent"]]
+    assert len(writes) == 1                      # ONE write, not one per runner
+    w_i = kids.index(writes[0])
+    runners = [c for c in kids if c.get("tool") == "shell"
+               and "analyze_sales.py" in str((c.get("args") or {}).get("cmd", ""))]
+    assert len(runners) == 2
+    assert all(w_i in (c.get("deps") or []) for c in runners)   # run AFTER the write
+    _, errs = _build_children({"root": Node(id="root", intent="t", depth=0)},
+                              "root", kids)
+    assert errs == []
+    # a script a sibling already writes is left alone; -c/-m are not files
+    out2 = {"children": [
+        {"intent": "make the helper", "tool": "write_file",
+         "args": {"path": "analyze_sales.py", "content": "x = 1\n"},
+         "deps": [], "success_predicate": "ok"},
+        {"intent": "run it", "tool": "shell",
+         "args": {"cmd": "python analyze_sales.py"}, "deps": [0], "success_predicate": "ok"},
+        {"intent": "inline", "tool": "shell",
+         "args": {"cmd": "python -c 'print(1)'"}, "deps": [], "success_predicate": "ok"}]}
+    shaped2 = a._shape_children(out2, {"id": "root", "depth": 0,
+                                       "intent": "count things in data-lab/sales.csv"},
+                                tools, resolve_params({}))
+    assert [c for c in shaped2["children"] if c.get("tool") is None] == []
+    # inside a file-producing task the split must NOT fire again — it recursed
+    # to 35 nodes / depth 6 live (this level writes ONE file)
+    out3 = {"children": [
+        {"intent": "compute", "tool": "shell",
+         "args": {"cmd": "python helper.py"}, "deps": [], "success_predicate": "ok"}]}
+    shaped3 = a._shape_children(out3, {"id": "root.1", "depth": 1,
+                                       "intent": "write the corrected contents of "
+                                                 "analyze_sales.py (part of: totals)"},
+                                tools, resolve_params({}))
+    assert [c for c in shaped3["children"] if c.get("tool") is None] == []
+
+
+def test_sink_intent_kept_for_deliverables_over_input_contents():
+    """'write the contents of X to Y' is a report task: the sink's text goes to
+    Y — it must NOT be reframed to 'corrected contents of X', which would mark
+    the INPUT data for rewriting."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    out = {"children": [
+        {"intent": "compute", "tool": "shell", "args": {"cmd": "true"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Write the contents of data-lab/"
+                                               "sales.csv to data-lab/report.md"},
+                               tools, resolve_params({}))
+    sinks = [c for c in shaped["children"] if c.get("tool") == "llm"]
+    assert "corrected contents" not in sinks[0]["intent"]
+
+
+def test_shape_children_never_emits_forward_deps():
+    """Top-ups append after the model's own sink; the sink's 'deps = all
+    siblings' wiring must not point FORWARD or core rejects the whole plan
+    (live T3: 'cannot decompose' x3 -> 1-node run). The sink moves last."""
+    from harness.prompts import resolve_params
+    from harness.core import _build_children
+    from harness.models import Node
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    out = {"children": [
+        {"intent": "compute", "tool": "shell", "args": {"cmd": "true"},
+         "deps": [], "success_predicate": "ok"},
+        {"intent": "report", "tool": "llm", "args": {}, "deps": [0],
+         "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root", "depth": 0,
+                                     "intent": "Analyze data-lab/sales.csv and write "
+                                               "a report to data-lab/report.md"},
+                               tools, resolve_params({}))
+    kids = shaped["children"]
+    sink_i = max(i for i, c in enumerate(kids) if c.get("tool") == "llm")
+    assert sink_i == len(kids) - 2          # sink last-but-the-write-back
+    assert all(d < sink_i for d in kids[sink_i]["deps"])
+    _, errs = _build_children({"root": Node(id="root", intent="t", depth=0)},
+                              "root", kids)
+    assert errs == []
+
+
+def test_mutation_sub_plan_gets_read_sink_write():
+    """'write the corrected contents of X' (the mutation top-up's own child
+    intent) must shape into read -> sink -> write: live T2's sub-plan ran a read
+    only, never wrote, and the bug survived."""
+    from harness.prompts import resolve_params
+    a = object.__new__(Agent)
+    tools = {"shell": {"required": ["cmd"]}, "read_file": {"required": ["path"]},
+             "write_file": {"required": ["path", "content"]}}
+    out = {"children": [
+        {"intent": "retrieve the contents of bugfix-lab/analyze.py",
+         "tool": "read_file", "args": {"path": "bugfix-lab/analyze.py"},
+         "deps": [], "success_predicate": "ok"}]}
+    shaped = a._shape_children(out, {"id": "root.5", "depth": 1,
+                                     "intent": "write the corrected contents of "
+                                               "bugfix-lab/analyze.py"},
+                               tools, resolve_params({}))
+    kids = shaped["children"]
+    assert any(c.get("tool") == "read_file"
+               and (c.get("args") or {}).get("path") == "bugfix-lab/analyze.py"
+               for c in kids)                                  # material for the fix
+    sinks = [i for i, c in enumerate(kids) if c.get("tool") == "llm"]
+    assert len(sinks) == 1                                      # corrected content
+    assert kids[sinks[0]]["intent"] == (
+        "write the corrected contents of bugfix-lab/analyze.py "
+        "(output the complete file)")   # the sink PRODUCES the file, not analysis
+    writer = [c for c in kids if c.get("tool") == "write_file"]
+    assert len(writer) == 1 and \
+        writer[0]["args"]["path"] == "bugfix-lab/analyze.py"     # the fix lands
+    assert writer[0]["args"]["content"] == {"$from": "root.5.2", "path": "text"}
+    assert writer[0]["deps"] == [sinks[0]]
+
+
+def test_repair_never_touches_from_bindings():
+    """$from bindings are structural: the repair model mangles them (live T2:
+    bind id 'root/analyze.py') and the exec is then rejected outright. Other
+    args still re-derive."""
+    captured = {}
+
+    class FixLlm:
+        calls = 0
+
+        def chat_json(self, sys_p, ask, **kw):
+            captured["ask"] = ask
+            return {"args": {"content": {"$from": "root/analyze.py", "path": "text"},
+                             "path": "other.py"},
+                    "success_predicate": "written"}
+
+    class Http:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, json=None):
+            self.posts.append((path, json))
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"status": "done", "result": {"bytes": 3}}
+
+            return R()
+
+    a = object.__new__(Agent)
+    a.llm, a.http, a.phase = FixLlm(), Http(), "x"
+    a.handle({"run_id": "r", "inputs": {}, "max_depth": 17, "constraints": [],
+              "context": {}, "prompts": {}, "params": {},
+              "tools": {"write_file": {"required": ["path", "content"]}},
+              "node": {"id": "root.4.5", "parent": "root.4", "intent": "write it",
+                       "tool": "write_file", "depth": 2, "attempts": 1,
+                       "args": {"path": "bugfix-lab/analyze.py",
+                                "content": {"$from": "root.4.4", "path": "text"}},
+                       "hint": "predicate unmet: x",
+                       "success_predicate": "ok"}})
+    execs = [p for p in a.http.posts if p[0].endswith("/exec")]
+    assert execs
+    args = execs[0][1]["args"]
+    assert args["content"] == {"$from": "root.4.4", "path": "text"}   # kept verbatim
+    assert args["path"] == "other.py"                                 # re-derived
+
+
+def test_force_synthesis_pins_root_sink_on_task_shapes():
+    """A pure-task plan at the ROOT still converges on one writer — the run head
+    must end holding the answer (root.result.text); deeper task splits stay lean."""
     kids = [{"intent": "write", "tool": "write_file",
              "args": {"path": "a", "content": "b"}, "deps": []}]
-    assert _force_synthesis(kids, "do x") == kids
+    out = _force_synthesis(kids, "do x")
+    assert [c["tool"] for c in out] == ["write_file", "llm"]
+    assert out[1]["deps"] == [0]
+    assert _force_synthesis(kids, "do x", depth=1) == kids
 
 
 def test_force_synthesis_converges_sink_over_abstract_branches():
@@ -310,7 +1006,7 @@ def test_llm_down_releases_without_spending_repairs(monkeypatch):
     report), and only posts FAILED once the node's attempts are exhausted."""
     import httpx
 
-    import harness.agent as ag
+    import harness.agent.base as ag
 
     class DownLlm:
         calls = 0
@@ -369,6 +1065,21 @@ def test_judge_prefers_the_tools_deterministic_check():
     tools = {"create_employee": {"check": "employee.id"}}
     assert a.judge(node, {"employee": {"id": 7}}, tools=tools) is True
     assert a.judge(node, {"employee": {}}, tools=tools) is False
+
+
+def test_shell_judge_is_deterministic_and_never_calls_the_llm():
+    # a 3b judge flunks large stdout dumps: whole benchmark runs escalated over
+    # correct greps judged "predicate unmet" — shell verdicts ride rc only
+    class BoomLlm:
+        def chat_json(self, *a, **k):
+            raise AssertionError("the LLM must not judge shell results")
+
+    a = object.__new__(Agent)
+    a.llm = BoomLlm()
+    node = {"tool": "shell", "success_predicate": "the response contains the height",
+            "intent": "get the height"}
+    assert a.judge(node, {"rc": 0, "stdout": "46 meters\n", "stderr": ""})
+    assert not a.judge(node, {"rc": 2, "stdout": "", "stderr": "grep: no such file"})
 
 
 # ---------- per-run prompts/params honored by the planner and judge ----------
@@ -665,7 +1376,7 @@ def test_approval_wait_times_out_after_deadline(monkeypatch):
                     return {"status": "pending"}
             return R()
 
-    monkeypatch.setattr("harness.agent.APPROVAL_TIMEOUT", 0.0)
+    monkeypatch.setattr("harness.agent.base.APPROVAL_TIMEOUT", 0.0)
     a = object.__new__(Agent)
     a.http = NeverDecide()
     out = a._wait("card-1")

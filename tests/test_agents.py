@@ -193,7 +193,11 @@ def test_delete_run_and_policy_edit(client):
     assert client.get(f"/runs/{run_id}").status_code == 404
     ok = client.post("/policy", json={"max_agents": 4, "approve_dag_edits": False})
     assert ok.status_code == 200 and ok.json()["max_agents"] == 4
-    bad = client.post("/policy", json={"max_depth": 3})
+    budget = client.post("/policy", json={"max_depth": 3})   # budget edits land, clamped
+    assert budget.status_code == 200 and budget.json()["max_depth"] == 3
+    bad = client.post("/policy", json={"max_depth": "three"})  # typo'd type rejects
     assert bad.status_code == 400
+    assert client.post("/policy", json={"nope": 1}).status_code == 400
     core.POLICY["max_agents"] = 2
     core.POLICY["approve_dag_edits"] = False
+    core.POLICY["max_depth"] = core.DEFAULT_MAX_DEPTH

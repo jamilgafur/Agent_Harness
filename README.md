@@ -50,6 +50,11 @@ UI: **http://localhost:8100** · Everything runs in Docker.
 - **Built for small models** — decomposition shrinks every LLM call to one
   small bounded job; reply *shape* is enforced by structured outputs;
   deterministic scaffolding fixes what 3b models get wrong structurally.
+- **Sampling + debate + voting** — per-run params `samples` (1–5) and
+  `debate_rounds` (0–3) coordinate several attempts at the *same* node:
+  K sampled draft answers/plans, rival-aware revision rounds, one judge
+  ballot picks the winner; judges become a strict-majority panel. Off by
+  default (samples=1, rounds=0 = exactly today's call pattern).
 - **Budget governor** — per-run caps (LLM calls, seconds, depth, nodes) that
   terminate a run (work kept) instead of letting it run away.
 - **Runs without any LLM** — template-DAG runs of auto-approved tools execute
@@ -124,6 +129,32 @@ decomposition builds on knowns instead of re-gathering them.
 
 Template-DAG runs skip the checkpoint: you already wrote the plan, they just run.
 
+### The model proposes, the harness decides
+
+Deterministic shaping sits between the model's plan and execution — code, not
+prompt text (`DEFAULT_PROMPTS` is untouched; the regression suite replays every
+measured failure this list fixes):
+
+- **The head always answers.** Synthesis writers survive dead siblings and run
+  once their deps are terminal; a parent with one dead child partial-settles
+  with the writer's text instead of going up answerless.
+- **Named deliverables land.** "…write X to `path`" gains a read → sink →
+  write chain whose write-back binds the sink's text; "write the corrected
+  contents of `path`" writes the file — "summarize the contents of" never does.
+- **Code files land as code.** A `*.py` write must parse and contain a real
+  statement: task echoes, `{{templates}}` and status lines are dropped at plan
+  time and refused by the judge, and when analysis prose wraps the fix in
+  fenced code the largest valid block is what lands.
+- **Invented scripts get created.** A shell running a bare `X.py` nobody writes
+  is split into write-then-run.
+- **Runtime errors reach the author.** A terminal failure whose error names a
+  workspace file re-synthesizes the content source with the traceback in hand,
+  re-lands the write, and re-runs the failure behind it (bounded, once per
+  source). Predicate echoes never trigger it.
+- **Plans stay runnable.** No forward deps (the sink moves last), reads never
+  count as writes, named input files get read whole, and failed hints carry
+  rc + stderr so repair sees why the call died.
+
 ## Adapt it (prompts, parameters, models)
 
 Small models suffice here: decomposition shrinks every LLM call to a small,
@@ -134,7 +165,11 @@ can override:
 - `decompose` / `synthesize` / `judge` — the planner / writer / judge prompts;
 - `model` ("" = env default), `temperature` (0–1), `child_cap` (1–6),
   `gather_tools` (which tools count as evidence-gatherers), `sink_tool`
-  (the virtual writer's name), `max_results` (3–10).
+  (the virtual writer's name), `max_results` (3–10);
+- `samples` (1–5) and `debate_rounds` (0–3) — ensemble coordination
+  (see `harness/ensemble.py`): candidate answers/plans are sampled, debated
+  and voted; calls are sequential on the one local runner, so cost is
+  additive per node.
 
 UI: the **⚙ prompts & parameters** editor in the 📋 plan bar; any node's args
 are editable from its detail panel — both apply while planning. API:
@@ -144,6 +179,186 @@ curl -X PUT localhost:8100/runs/$RUN/config -H 'content-type: application/json' 
   -d '{"prompts": {"synthesize": "Write it as an executive brief, bullets only."},
        "params": {"child_cap": 3}}'
 ```
+
+## Measurements: what the ensemble buys you
+
+Small local models are brittle in two specific ways the ensemble addresses:
+**confident-wrong answers** (rate problems, trick qualifiers) and **flaky
+verdicts** (a single judge misreading a fine execution). Sampling draws K
+independent attempts, debate lets attempts correct each other, and one judge
+ballot picks the winner — at an **exact, deterministic cost**:
+
+| config | LLM calls per node | formula |
+|---|---|---|
+| baseline (`samples=1`) | 1 | — |
+| sampled (`samples=K`) | K+1 | K drafts + 1 vote |
+| debated (`samples=K, debate_rounds=R`) | K×(1+R)+1 | K drafts + K·R revisions + 1 vote |
+
+Measured on this machine with `examples/benchmark_ensemble.py` (local Ollama
+0.40, GTX 1660 Ti, 2026-11-09 — your numbers will differ with hardware and
+model; the calls column never does):
+
+**`llama3.1:8b` and `qwen2.5:3b`, full 8-task suite each, temperature 0.2:**
+
+| model | config | accuracy | LLM calls/task | wall s/task |
+|---|---|---|---|---|
+| llama3.1:8b | baseline | 8/8 | 1.0 | 25.3 |
+| llama3.1:8b | sampled (`samples=3`) | 8/8 | 4.0 | 97.6 |
+| llama3.1:8b | debated (`samples=3, debate_rounds=1`) | 8/8 | 7.0 | 181.5 |
+| qwen2.5:3b | baseline | 8/8 | 1.0 | 13.5 |
+| qwen2.5:3b | sampled (`samples=3`) | 8/8 | 4.0 | 48.6 |
+| qwen2.5:3b | debated (`samples=3, debate_rounds=1`) | 8/8 | 7.0 | 96.2 |
+
+Reading it honestly: **both models already ace checkable word problems — even
+the rate traps — so there was no accuracy headroom to buy.** The mechanism
+(sampling, rival revision, one ballot) ran end-to-end on both, measured calls
+matched the cost model in all 48 task-runs, and debating cost 7.1× the wall
+time to gain 0 accuracy. That is exactly why `samples=1, debate_rounds=0`
+ships **off**: on well-specified tasks an ensemble is pure spend. Where it
+pays: genuinely flaky models/tasks, and the **judge panel** (`samples>1` on
+judging only), because a single small-model verdict is the brittliest call in
+the system (`harness/agent/judging.py` documents the failure mode; agent-side
+acceptance had to go deterministic because of it).
+
+Reproduce with your own model/hardware (numbers are hardware- and model-bound):
+
+```sh
+pip install -r requirements.txt
+python examples/benchmark_ensemble.py --samples 3 --rounds 1        # full 8-task suite
+python examples/benchmark_ensemble.py --skip 4                      # the trap-question half
+MODEL=qwen2.5:3b python examples/benchmark_ensemble.py --limit 2    # smoke
+```
+
+The script also asserts the measured call count matches the cost model —
+the *accuracy* column varies with model and task; the *cost* column never
+surprises. Treat suite accuracy as a smoke signal: 4–8 problems is enough to
+show the mechanism works, not to rank models — rerun it on tasks from your
+own domain (the suite is a plain list in the script).
+
+## Measurements: does decomposition beat one flat call?
+
+The product hypothesis is that decomposing a multi-part question into a tree
+(gather evidence per part → branch writers → head synthesis) beats one
+monolithic call. `examples/benchmark_decomposition.py` measures it honestly:
+
+- **12 tasks × 4 extractable parts** on invented-fact corpora (memory cannot
+  cheat: the facts exist nowhere else), identical evidence on both arms —
+  flat gets it inline, the tree gets it through canned tool results *whatever
+  retrieval tool its plan picks* (tool choice is not the measured variable).
+- **Scoring is deterministic** substring-per-part — the eval never asks an LLM
+  to grade itself. The tree arm is audited for nodes/depth/grounding.
+- The report separates **pipeline reliability** (did the run settle at all)
+  from **content quality** (parts a *settled* run kept), because pre-fix runs
+  conflated the two.
+
+Measured on this machine (Ollama 0.40, GTX 1660 Ti, temperature 0.2):
+
+| model | arm | parts covered (48) | tasks fully correct (12) | calls/task | s/task | tree settled |
+|---|---|---|---|---|---|---|
+| qwen2.5:3b | flat | 46 (95%) | 10 | 1.0 | 7 | — |
+| qwen2.5:3b | tree | 26 (54%) | 5 | 5.2 | 84 | 10/12 |
+| llama3.1:8b | flat | 41 (85%) | 8 | 1.0 | 14 | — |
+| llama3.1:8b | tree | 7 (14%) | 1 | 8.0 | 211 | 3/12 |
+
+**The honest reading: on this suite, at 3b–8b scale, the claim does NOT
+hold — flat wins, and it's not close.** 4–5 sentence corpora fit in every
+context; decomposition can't add evidence, only move it around, and every
+funnel (branch summary → parent) instead loses parts (settled qwen tasks:
+tree 26/40 vs flat 38/40). Two hard-won facts about *where* the tree dies:
+
+1. **Reliability dominates quality.** Across the fix campaign, qwen settle
+   rate went 4/12 → 10/12; llama stayed 3/12 because 8b produces bigger,
+   redundant trees (13.9 nodes/task) whose branches more often burn their
+   3-attempt repair budget. Every unsettled run now terminates *honestly*
+   (escalated, diagnosed) instead of spinning — before the fixes, stalled
+   runs silently returned empty heads and scored 0 anyway.
+2. **The ground truth held everywhere**: grounded 12/12 on both models —
+   every citation the tree emitted traced to gathered pages, even in failed
+   runs. Whatever the tree writes, it doesn't invent citations; the funnel
+   loses parts but never their provenance.
+
+What broke along the way (all fixed, covered by tests): LLM judges flunking
+correct shell output, no-material "answer cards" passing acceptance checks,
+oblivious retry loops, dead branches holding runs active forever, and the
+budget governor re-killing user-resumed runs within a second. The remaining
+gap is plan-shape variance at small scale — not a harness hang.
+
+Reproduce: `python examples/benchmark_decomposition.py --limit 3` (smoke, one
+model) — flags `--model --skip/--limit --out`. Suite + report live in the
+script; the settled-vs-reliability split prints per run.
+
+## Live intent E2E (`examples/intent-e2e.sh`)
+
+Five intent-only tests against the live stack with a small (3B) model — a
+calculator app, a seeded-bug fix, a CSV→report, quicksort-vs-mergesort, and an
+invented-facts QA — scored on both the decomposition (plan shape) and the head
+answer (part coverage). Across 19 measured rounds: the calculator and the
+parallel-comparison tests pass every round; the seeded-bug fix passes every
+round once the mutation pipeline landed; the invented-facts test passes except
+for model name-transcription slips. The CSV→report test lands its report and
+the top product every time; its exact grand total is the model's arithmetic
+ceiling — 3B models can't sum ten rows of decimals in-head, and their
+generated aggregation code breaks. `./examples/intent-e2e.sh` runs it
+(`t1`…`t5` selects one; `--selfcheck` validates the checkers offline).
+
+## Audit a run
+
+The claim is the pipeline, not the calls: sentence in → decomposed DAG → human
+checkpoints → grounded answer out, every step inspectable.
+`examples/audit_run.py` drives that whole loop in-process (real core, real
+worker, LLM swapped for a deterministic double) and then audits what came out:
+
+```console
+$ python examples/audit_run.py
+AUDIT — offline (scripted model + canned tools)
+nodes: 8 · repairs: 1 · delegation depth: 2
+
+root       [DONE 1x 0c plan] How transformers scale: attention cost vs sequence l
+  root.1     [DONE 1x 0c plan] branch A: find primary sources on attention's quadra
+    root.1.1   [DONE 2x 0c web_search] gather evidence: an n x n affinity matrix per layer
+    root.1.2   [DONE 1x 1c llm] summarize the quadratic cost evidence with citations
+  root.2     [DONE 1x 0c plan] branch B: find primary sources on transformer scalin
+    root.2.1   [DONE 1x 0c web_search] gather evidence: power-law fits and compute-optimal
+    root.2.2   [DONE 1x 1c llm] summarize the scaling-law evidence with citations
+  root.3     [DONE 1x 2c llm] write the answer from both branches
+
+CHECKS
+  [PASS] settled: every node DONE: True
+  [PASS] first-pass success: 7/8
+  [PASS] grounding: cited URLs are gathered URLs: True
+  [PASS] persistence: restart reload identical: True
+
+HUMAN LEDGER (4 decisions):
+  - approve
+  - approve (web_search)
+  - approve (web_search)
+  - approve (web_search) [edited args]
+
+GROUNDING: 4 cited ⊆ 4 gathered — no invented citations
+BUDGET: 4 accounted of 8 observed model calls, cap 500 (successful decompose
+calls ride no report) · stats: {"llm_calls": 4, "execs": 3, "approvals": 3, "patches": 3}
+TRAIL: 27 events persisted
+```
+
+What each check proves:
+
+- **settled / first-pass** — the tree converged bottom-up; one scripted flake
+  (empty search results) shows the judge rejecting and the repair loop
+  recovering (`root.1.1` done on attempt 2) instead of a silently bad run.
+- **grounding** — every URL in the final answer is a URL the tree actually
+  gathered. An invented citation flips this to FAIL. This is the check that
+  makes "grounded in the graph, not memory" falsifiable.
+- **persistence** — a simulated restart reloads state from SQLite and it is
+  byte-identical; 27 events form the replayable trail.
+- **human ledger** — the HIL story as a number: one plan checkpoint, three
+  exec cards, one edited-and-resubmitted query. `--live --interactive` puts a
+  real (timed) human at those cards.
+- **budget** — accounted vs observed model calls are both shown, including
+  the honest quirk that successful decompose calls ride no result report.
+
+Offline mode is deterministic and runs in CI (3 tests in
+`tests/test_audit_run.py` assert every invariant); `--live` swaps in your
+Ollama model against the same pipeline.
 
 ## Tools
 
@@ -204,6 +419,24 @@ New tools behave like built-ins: the planner can decompose onto them the moment
 "unvetted", so its first use parks a card even if `auto_approve` names it (a
 dropped file must not silently widen the unaided surface); approving vets it.
 
+### Register a skill at runtime (no file drop) — `POST /skills`
+
+The AI (or the UI's *Tools & skills* panel) can register a declarative skill
+while the stack is running — a name, a description, required args, and a shell
+template with `{arg}` placeholders:
+
+```sh
+curl -X POST localhost:8100/skills -H 'content-type: application/json' -d '{
+  "name": "count_lines", "desc": "count the lines of a workspace file",
+  "required": ["path"], "cmd": "wc -l < {path}"}'
+```
+
+Core validates the spec, the sandbox turns it into a `/workspace/tools/*.py`
+module (args shlex-quoted), the registry re-syncs, and the planner can pick the
+skill at its **very next claim**. It lands as *unvetted*, so the human gate
+above still applies. For anything richer than a shell template, drop a Python
+`.py` directly — same directory, same discovery.
+
 ## Configuration
 
 ### `harness.toml` — `[policy]`
@@ -260,7 +493,7 @@ Core is a plain-JSON REST API (see `harness/models.py` for request bodies):
 | `POST /runs/{id}/patch` | graph ops (`add_node`, `add_edge`, `replace_tool`, `retry_node`) |
 | `GET /runs/{id}/events?after_id=` | persisted event log (capped) |
 | `GET /runs/{id}/knowledge` · `…/snapshot` | knowledge tree · save-as-template |
-| `GET /tools` · `POST /tools/sync` | tool registry + hot-reload sync |
+| `GET /tools` · `POST /tools/sync` · `POST /skills` | tool registry, hot-reload sync, runtime skill registration |
 | `GET /metrics` · `GET /policy` · `POST /policy` · `GET /autosize` | paper §V metrics, runtime policy, sizing hint |
 | `WS /ws` | live state / approvals / log / agents push to the UI |
 
@@ -323,7 +556,9 @@ Read [SECURITY.md](SECURITY.md) before deploying. The short version:
 - **Wires** — dependencies; green once the source finished.
 - **Agents** — colored chips that ride the wires to the node they're working;
   the label shows their phase. A `?` means they're parked on an approval.
-- **Panels** — node detail (click a card), workspace files, event log.
+- **Panels** — the rail under the canvas: node inspector (click a card),
+  **tools & skills** (registry plus the runtime skill form), workspace files.
+  The developer panel (agents + event log) folds away at the bottom.
 - Pan: drag background · Zoom: wheel · `fit all` recenters.
 
 ## Development
@@ -352,14 +587,19 @@ docker compose up -d --build
   budget governor, WS, static UI
 - `harness/store.py` — SQLite: WAL-journaled, zlib-compressed run snapshots;
   approvals; capped event log
-- `harness/agent.py` — worker: claim → decompose/exec → neighbor-read → report
+- `harness/agent/` — the worker, split by duty: `base.py` (transport,
+  heartbeat, approvals), `planning.py` (decompose + deterministic shaping),
+  `writing.py` (grounded synthesis), `judging.py` (verdict panels),
+  `worker.py` (`Agent` = the mixins composed + claim loop)
+- `harness/ensemble.py` — sampling → debate → vote coordination for
+  answers and plans (per-run `samples`/`debate_rounds` params)
 - `harness/sandbox.py` — the only place tools run: shell/files/web/dynamic/MCP
 - `harness/llm.py` — Ollama client (structured outputs + repair round-trip)
 - `harness/prompts.py` — single source of truth for prompts/params; per-run
   overrides resolve through here
 - `harness/static/index.html` — the entire UI (no build step)
 - `plan.txt` — design history & decisions · `CHANGELOG.md` — release notes ·
-  `ROADMAP.md` — where this is going · `tests/` — 121 tests
+  `ROADMAP.md` — where this is going · `tests/` — the pytest regression suite
 
 ## License
 

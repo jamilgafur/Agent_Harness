@@ -5,6 +5,7 @@
 | `write-paper.json` | template DAG: `web_search` leaves → `write_file` sections → `shell` assemble (the original research flavor) |
 | `add-tests.json` | template DAG TDD loop: seed bug → red test → fix → green, zero LLM calls |
 | `codebase-inventory.json` | DAG works offline, any codebase: parallel `shell` gathers → `write_file` outline → one `llm` summary sink |
+| `intent-e2e.sh` | live intent-only E2E suite (5 tests): plan-shape checks on the decomposition + part-coverage checks on the head answer (`--selfcheck` needs no stack) |
 | `acceptance-demo.sh` | end-to-end unattended run of `add-tests.json` (template + auto_approve policy) |
 | `run-with-overrides.sh` | intent-only run with per-run `prompts`/`params` overrides (`PUT /runs/{id}/config`) |
 | `doc_writer.py` | dynamic Python tool: drop in `/workspace/tools/` + `POST /tools/sync` → claimable |
@@ -14,6 +15,7 @@
 
 - template JSONs: `curl -s -X POST http://localhost:8100/runs -H 'content-type: application/json' -d @examples/codebase-inventory.json`
 - scripts: `./examples/acceptance-demo.sh` / `./examples/run-with-overrides.sh` (core + sandbox up; the overrides script also needs one agent)
+- live intent E2E suite: `./examples/intent-e2e.sh` (core + sandbox + >=1 agent; `./examples/intent-e2e.sh t3` runs one test, `--selfcheck` validates the checkers offline)
 - UI: open http://localhost:8100 → template-DAG tab → paste the JSON
 
 The harness is domain-generic — the planner uses whatever tools/prompts you give it; these examples intentionally avoid web tools.

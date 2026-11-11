@@ -13,8 +13,10 @@ Approvals gate the UI, they are NOT an auth boundary: bind to localhost in compo
 anything untrusted shares the LAN. Single process; asyncio.Lock makes mutations atomic."""
 import asyncio
 import json
+import re
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,7 @@ from .models import (
     ClaimIn,
     ConfigIn,
     ConstraintIn,
+    DEFAULT_MAX_DEPTH,
     DecisionIn,
     DecomposeIn,
     ExecIn,
@@ -51,6 +54,7 @@ from .models import (
     RedirectIn,
     ResultIn,
     RunIn,
+    SkillIn,
 )
 from .prompts import DEFAULT_PARAMS, PROMPT_KEYS, resolve_params
 from .store import Store
@@ -60,9 +64,12 @@ POLICY: dict[str, Any] = CFG["policy"]
 TOOLS: dict[str, dict[str, Any]] = {
     "shell": {"desc": "run a shell command in the shared sandbox workspace",
               "required": ["cmd"]},
-    "read_file": {"desc": "read a file from the workspace", "required": ["path"]},
-    "write_file": {"desc": "write a file in the workspace", "required": ["path", "content"]},
-    "list_dir": {"desc": "list a directory in the workspace", "required": ["path"]},
+    "read_file": {"desc": "read a file from the workspace", "required": ["path"],
+                  "check": "content", "ground": {"path": "{path}"}},
+    "write_file": {"desc": "write a file in the workspace",
+                   "required": ["path", "content"], "check": "bytes"},
+    "list_dir": {"desc": "list a directory in the workspace", "required": ["path"],
+                 "check": "entries"},
     "web_search": {"desc": "search the web (SearXNG); returns [{title,url,snippet}]",
                    "required": ["query"], "ground": {"query": "{intent}"}},
     "http_fetch": {"desc": "fetch a URL and return readable text",
@@ -78,6 +85,46 @@ _lock = asyncio.Lock()
 _ws: list[WebSocket] = []
 # agent_id -> liveness/position/phase; in-memory on purpose (dead agents die with core)
 AGENTS: dict[str, dict[str, Any]] = {}
+
+# ---------- shared memory buffer: TTL result cache for idempotent read tools ----------
+# web_search / http_fetch are read-only against the world: identical args inside the
+# TTL window return the memoized result, skipping sandbox+network+egress entirely.
+# It is shared across runs and agents — a fact one agent fetched, all agents reuse.
+TOOL_CACHE_TTL_S = 900
+TOOL_CACHE_MAX = 64
+_CACHEABLE_TOOLS = frozenset({"web_search", "http_fetch"})
+_TOOL_CACHE: "OrderedDict[str, tuple[float, dict[str, Any]]]" = OrderedDict()
+_TOOL_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _tool_cache_key(tool: str, args: dict[str, Any]) -> str:
+    return f"{tool}\x00{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _tool_cache_get(tool: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    hit = _TOOL_CACHE.get(_tool_cache_key(tool, args))
+    if hit is None:
+        _TOOL_CACHE_STATS["misses"] += 1
+        return None
+    ts, val = hit
+    if time.time() - ts > TOOL_CACHE_TTL_S:
+        del _TOOL_CACHE[_tool_cache_key(tool, args)]
+        _TOOL_CACHE_STATS["misses"] += 1
+        return None
+    _TOOL_CACHE.move_to_end(_tool_cache_key(tool, args))
+    _TOOL_CACHE_STATS["hits"] += 1
+    return {**val, "cached": True}   # shallow copy: cached payloads are read-only
+
+
+def _tool_cache_put(tool: str, args: dict[str, Any], val: dict[str, Any]) -> None:
+    # failures (rc != 0) and stderr-bearing sandboxes never enter the cache
+    if isinstance(val, dict) and val.get("rc", 0) not in (0, None):
+        return
+    key = _tool_cache_key(tool, args)
+    _TOOL_CACHE[key] = (time.time(), val)
+    _TOOL_CACHE.move_to_end(key)
+    while len(_TOOL_CACHE) > TOOL_CACHE_MAX:
+        _TOOL_CACHE.popitem(last=False)   # LRU eviction
 
 
 def tool_arg_errors(nodes: dict[str, Node]) -> list[str]:
@@ -174,6 +221,70 @@ async def _state(run_id: str) -> None:
                       "pending": sorted(_pending_approvals(run_id))})
 
 
+def _writers(run: dict[str, Any]) -> set[str]:
+    """Nodes that materialize an answer from others' results: the synthesis
+    sink and `$from` write-backs (deliverable writers). They must survive dead
+    siblings and run once their deps are terminal — cascade-blocking them turned
+    one dead leaf into an answerless head and a never-written deliverable."""
+    sink = resolve_params(run.get("params"))["sink_tool"]
+    return {n.id for n in run["nodes"].values()
+            if n.tool == sink or "$from" in json.dumps(n.args or {})}
+
+
+def _refine_writer(run: dict[str, Any], nid: str, hint: str) -> None:
+    """A terminal failure whose error names a workspace file gets ONE
+    error-driven refinement of the chain that AUTHORED that file: the content
+    source re-synthesizes with the runtime error in hand, the write re-lands,
+    and the failed node re-runs against the fixed file (dep-ordered behind the
+    write). Measured live: the generated script failed at run time
+    ('ModuleNotFoundError', wrong column names) while its writer sat DONE and
+    every runner burned its retries against the broken artifact — the error
+    never reached the author. Bounded: one refine per content source, one
+    retry per node.
+    shortcut: markers live on the run dict (lost on core restart mid-run), and
+    literal-content writes are not refined — only `$from` chains; upgrade when
+    a live run shows one needing feedback."""
+    n = run["nodes"][nid]
+    if _budget_breach(run):
+        return                       # an out-of-budget run must end, not loop
+    # only the EXECUTION ERROR may attribute a failure to a file — the predicate
+    # echo names every task path (live T2: 'identify failing tests in
+    # bugfix-lab/analyze.py' rewrote a working fix into test code)
+    err = hint.split(" | rc=", 1)[1] if " | rc=" in (hint or "") else ""
+    if not err:
+        return
+    chain = [w for w in run["nodes"].values()
+             if w.tool == "write_file" and w.id != nid
+             and isinstance((w.args or {}).get("content"), dict)
+             and "$from" in w.args["content"]
+             and str(w.args.get("path") or "")
+             and re.search(r"(?<![\w.-])" + re.escape(str(w.args["path"])), err)]
+    if not chain:
+        return
+    w = max(chain, key=lambda x: len(str(x.args.get("path") or "")))
+    s = run["nodes"].get(w.args["content"]["$from"])
+    if s is None:
+        return
+    refined = run.setdefault("refined", [])
+    retried = run.setdefault("retried", [])
+    if s.id not in refined:
+        refined.append(s.id)
+        s.state, s.attempts = NodeState.PENDING, 0
+        s.hint = (f"the file produced from your previous output failed at run "
+                  f"time: {hint}")[:300]
+        w.state, w.attempts, w.hint = NodeState.PENDING, 0, ""
+    if nid in retried:
+        return
+    retried.append(nid)
+    if w.state == NodeState.DONE:
+        n.state, n.attempts, n.hint = NodeState.PENDING, 0, ""
+    else:
+        # re-run AFTER the rewrite, deferred until the write reports DONE. No
+        # dep edge: the runner may already FEED the chain (its output is the
+        # sink's material) — an edge back closed a cycle and deadlocked the run
+        run.setdefault("defer_retry", {}).setdefault(w.id, []).append(nid)
+
+
 def _fail_cascade(run: dict[str, Any], nid: str, hint: str, state: NodeState) -> None:
     """Terminal failure of ONE node: it -> state, its dep-consumers -> BLOCKED.
     Parents are NOT escalated (a leaf going purple must not sink the whole run);
@@ -181,8 +292,12 @@ def _fail_cascade(run: dict[str, Any], nid: str, hint: str, state: NodeState) ->
     reopens the branch — patch_run lifts BLOCKED nodes whose ancestors cleared."""
     node = run["nodes"][nid]
     node.state, node.hint = state, hint
+    writers = _writers(run)
     for d in descendants(run["nodes"], nid):
         dn = run["nodes"][d]
+        if dn.id in writers:
+            continue   # writers answer from the material that SURVIVED — blocking
+                       # them turned one dead leaf into an answerless run
         if dn.state in (NodeState.PENDING, NodeState.RUNNING, NodeState.REPAIRING,
                         NodeState.WAITING):
             dn.state, dn.hint = NodeState.BLOCKED, f"upstream {nid} {state.value.lower()}"
@@ -190,6 +305,48 @@ def _fail_cascade(run: dict[str, Any], nid: str, hint: str, state: NodeState) ->
         p = run["nodes"][node.parent]
         if p.state != NodeState.DONE:
             p.hint = f"child {nid} {state.value.lower()}: {hint}"[:300]
+    _refine_writer(run, nid, hint)   # before collapse: a refined node is alive,
+    _collapse_dead_branch(run, nid)  # its parents must keep waiting for it
+
+
+def _collapse_dead_branch(run: dict[str, Any], nid: str) -> None:
+    """Escalation is terminal: a WAITING parent whose children ALL went terminal
+    can never settle (settle needs all-DONE) — escalate it too, bubbling to the
+    root, so a branch that ran out of repairs fails the run honestly instead of
+    leaving unclaimable WAITING nodes: those hold `_active` true forever (the
+    decomposition benchmark had runs spin until the driver gave up on them)."""
+    pid = run["nodes"][nid].parent
+    terminal = (NodeState.DONE, NodeState.FAILED, NodeState.BLOCKED, NodeState.ESCALATED)
+    writers = _writers(run)
+    while pid and pid in run["nodes"]:
+        p = run["nodes"][pid]
+        kids = [n for n in run["nodes"].values() if n.parent == pid]
+        if p.state != NodeState.WAITING or not kids \
+                or all(k.state == NodeState.DONE for k in kids) \
+                or not all(k.state in terminal for k in kids):
+            return
+        writer = max((k for k in kids
+                      if k.state == NodeState.DONE
+                      and isinstance(k.result, dict) and k.result.get("text")),
+                     key=lambda k: len(k.deps), default=None)
+        if writer:
+            # partial settle: a sibling died but the writer answered from what
+            # survived — the head must hold that text, not go up empty
+            p.state = NodeState.DONE
+            p.result = {"text": writer.result["text"], "from": writer.id}
+            _settle(run, p.id)
+            return
+        failed = ", ".join(k.id for k in kids if k.state != NodeState.DONE)
+        p.state = NodeState.ESCALATED
+        p.hint = f"children failed: {failed}"[:300]
+        for d in descendants(run["nodes"], p.id):   # dep-consumers of a collapsed
+            dn = run["nodes"][d]                    # parent can never run — block
+            if dn.id in writers:
+                continue                            # writers still answer
+            if dn.state in (NodeState.PENDING, NodeState.RUNNING, NodeState.REPAIRING,
+                            NodeState.WAITING):     # them too, or they sit claimable
+                dn.state, dn.hint = NodeState.BLOCKED, f"upstream {p.id} escalated"[:300]
+        pid = p.parent
 
 
 def _settle(run: dict[str, Any], nid: str) -> None:
@@ -209,6 +366,14 @@ def _settle(run: dict[str, Any], nid: str) -> None:
             p.result = ({"text": writer.result["text"], "from": writer.id}
                         if writer else {k.id: k.result for k in kids})
             _settle(run, p.id)
+        elif kids and all(k.state in (NodeState.DONE, NodeState.FAILED,
+                                      NodeState.BLOCKED, NodeState.ESCALATED)
+                          for k in kids):
+            # the branch can't settle (someone terminal-failed) and its LAST kid
+            # just finished: _collapse_dead_branch only ran at the failure itself,
+            # while siblings were still live — re-check here or the parent stays
+            # WAITING forever and holds `active` true
+            _collapse_dead_branch(run, nid)
 
 
 async def _exec_tool(tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -216,6 +381,10 @@ async def _exec_tool(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     endpoints; anything else is a dynamic tool from /workspace/tools (P2)."""
     if tool == "llm":   # virtual, agent-side only — never sandboxed
         return {"rc": -7, "stderr": "llm is agent-side; not executable via the sandbox"}
+    if tool in _CACHEABLE_TOOLS:
+        cached = _tool_cache_get(tool, args)
+        if cached is not None:
+            return cached
     path = {"shell": "/shell", "read_file": "/read_file", "write_file": "/write_file",
             "list_dir": "/list_dir", "web_search": "/web_search",
             "http_fetch": "/http_fetch"}.get(tool, "/run_tool")
@@ -224,7 +393,10 @@ async def _exec_tool(tool: str, args: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=70) as c:
             r = await c.post(CFG["sandbox_url"] + path, json=payload)
             r.raise_for_status()
-            return r.json()
+            out = r.json()
+            if tool in _CACHEABLE_TOOLS:
+                _tool_cache_put(tool, args, out)
+            return out
     except httpx.HTTPStatusError as e:
         return {"rc": -3, "stdout": "",
                 "stderr": f"sandbox {e.response.status_code}: {e.response.text[:300]}"}
@@ -366,7 +538,8 @@ async def health() -> dict[str, Any]:
             ollama_ok = (await c.get(CFG["ollama_url"] + "/api/tags")).status_code == 200
     except Exception:
         pass
-    return {"ok": True, "ollama": ollama_ok, "runs": len(RUNS), "agents": len(AGENTS)}
+    return {"ok": True, "ollama": ollama_ok, "runs": len(RUNS), "agents": len(AGENTS),
+            "tool_cache": {"entries": len(_TOOL_CACHE), **_TOOL_CACHE_STATS}}
 
 
 @app.get("/tools")
@@ -378,11 +551,34 @@ def tools() -> dict[str, Any]:
 async def tools_sync() -> dict[str, Any]:
     """Pull dynamic tools (P2) from the sandbox into the registry. Repeatable:
     re-sync after dropping or editing a .py in /workspace/tools."""
+    return await _sync_tools()
+
+
+async def _sandbox_get(path: str) -> dict[str, Any]:
+    """Sandbox HTTP seam (tests stub this): GET and return JSON."""
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(CFG["sandbox_url"] + path)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _sandbox_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Sandbox HTTP seam (tests stub this): POST and return JSON or HTTP 4xx."""
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(CFG["sandbox_url"] + path, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(r.status_code,
+                                f"sandbox: {r.json().get('detail', r.text)[:200]}")
+        return r.json()
+
+
+async def _sync_tools() -> dict[str, Any]:
+    """Pull dynamic tools (P2) from the sandbox into TOOLS; hot-reload removes
+    vanished tools too. Shared by /tools/sync and /skills."""
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(CFG["sandbox_url"] + "/discover_tools")
-            r.raise_for_status()
-            found = r.json().get("tools", {})
+        found = (await _sandbox_get("/discover_tools")).get("tools", {})
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"sandbox: {type(e).__name__}")
     for name in [k for k, v in TOOLS.items() if v.get("dynamic") and k not in found]:
@@ -396,6 +592,28 @@ async def tools_sync() -> dict[str, Any]:
                 ent[extra] = meta[extra]
         TOOLS[name] = ent
     return {"synced": sorted(found), "tools": TOOLS}
+
+
+_SKILL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+
+
+@app.post("/skills")
+async def skills_create(body: SkillIn) -> dict[str, Any]:
+    """The AI (or the UI) registers a NEW tool at runtime: a declarative spec
+    (name, desc, required args, shell template) becomes a tool the planner can
+    pick from the very next claim. A new tool's first use shows the 'unvetted'
+    approval card unless it is auto-approved, keeping the human gate."""
+    if not _SKILL_NAME.match(body.name):
+        raise HTTPException(400, f"bad skill name {body.name!r} (lowercase, digits, _)")
+    if body.name in TOOLS and not TOOLS[body.name].get("dynamic"):
+        raise HTTPException(409, f"{body.name!r} is a built-in tool")
+    await _sandbox_post("/create_skill", body.model_dump())
+    await _sync_tools()
+    if body.name not in TOOLS:
+        raise HTTPException(502, "sandbox registered the file but discovery lost it")
+    store.log("-", "info", "skill", "user", "core",
+              f"skill registered: {body.name} ({body.desc[:120]})")
+    return {"created": body.name, "tool": TOOLS[body.name]}
 
 
 @app.get("/policy")
@@ -423,14 +641,54 @@ async def autosize() -> dict[str, Any]:
 
 @app.post("/policy")
 async def set_policy(body: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"max_agents", "approve_dag_edits", "claim_lease_seconds",
-               "confirm_actions", "auto_approve"}
-    unknown = set(body) - allowed
+    """Runtime knobs. Numeric budgets land via the UI settings panel, so they are
+    validated + clamped here: a typo in the UI must not misbehave the governor."""
+    editable_bool = {"confirm_actions", "approve_dag_edits"}
+    editable_list = {"auto_approve"}
+    bounds = {"max_agents": (1, 32), "max_nodes": (8, 2000),
+              "max_depth": (2, DEFAULT_MAX_DEPTH),  # config's depth is legal to set back
+              "max_repairs": (1, 10), "max_llm_calls": (10, 100000),
+              "max_seconds": (60, 86400), "claim_lease_seconds": (10, 3600)}
+    unknown = set(body) - editable_bool - editable_list - set(bounds)
     if unknown:
         raise HTTPException(400, f"not editable at runtime: {sorted(unknown)}")
-    POLICY.update(body)
+    clean: dict[str, Any] = {}
+    for k, v in body.items():
+        if k in bounds:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise HTTPException(400, f"{k} must be a number")
+            lo, hi = bounds[k]
+            clean[k] = int(min(hi, max(lo, v)))
+        elif k in editable_bool:
+            if not isinstance(v, bool):
+                raise HTTPException(400, f"{k} must be a boolean")
+            clean[k] = v
+        else:   # auto_approve
+            if not isinstance(v, list) or not all(isinstance(t, str) for t in v):
+                raise HTTPException(400, "auto_approve must be a list of tool names")
+            clean[k] = [t for t in v if t in TOOLS]
+    POLICY.update(clean)
     await _broadcast({"type": "policy", "policy": POLICY})
     return POLICY
+
+
+@app.get("/tools/cache")
+def tool_cache_stats() -> dict[str, Any]:
+    """Shared-memory buffer observability: what's memoized and how much work it saved."""
+    now = time.time()
+    return {"entries": [{"tool": k.split("\x00", 1)[0],
+                         "args": json.loads(k.split("\x00", 1)[1]),
+                         "age_s": round(now - ts, 1)}
+                        for k, (ts, _) in _TOOL_CACHE.items()],
+            "ttl_s": TOOL_CACHE_TTL_S, "max_entries": TOOL_CACHE_MAX,
+            **_TOOL_CACHE_STATS}
+
+
+@app.delete("/tools/cache")
+def tool_cache_clear() -> dict[str, Any]:
+    n = len(_TOOL_CACHE)
+    _TOOL_CACHE.clear()
+    return {"cleared": n}
 
 
 @app.post("/heartbeat")
@@ -781,7 +1039,7 @@ async def claim(body: ClaimIn) -> dict[str, Any]:
                           f"run terminated: {breach}")
                 terminated.append(run["id"])
                 continue
-            cands = ready_nodes(run["nodes"])
+            cands = ready_nodes(run["nodes"], resilient=_writers(run))
             if run.get("phase") == "planning":
                 # plan-first: only abstract nodes are claimable, and planning runs on
                 # structure, not results — deps WITHOUT a tool are free context, so the
@@ -901,6 +1159,12 @@ async def report(run_id: str, nid: str, body: ResultIn) -> dict[str, Any]:
         if body.state == "DONE":
             n.state, n.result, n.hint = NodeState.DONE, body.result, ""
             _settle(run, nid)
+            for d in run.get("defer_retry", {}).pop(nid, []):
+                dn = run["nodes"].get(d)
+                if dn is not None and dn.state != NodeState.PENDING:
+                    # error-driven refinement: the artifact is fixed — the node
+                    # that failed against it gets its re-run now
+                    dn.state, dn.attempts, dn.hint = NodeState.PENDING, 0, ""
         elif n.type == NodeType.LOOP:
             if n.attempts < n.max_iterations:
                 # shortcut: loop = requeue-per-iteration, not DAG unrolling; upgrade
@@ -995,6 +1259,15 @@ async def patch_run(run_id: str, patch: Patch) -> dict[str, Any]:
                     for a in _ancestors({**run, "nodes": new_nodes}, n.id)):
                 n.state, n.hint = NodeState.PENDING, ""
         run["nodes"] = new_nodes
+        if time.time() - run["created"] >= POLICY["max_seconds"]:
+            # user patch on an out-of-budget (already budget-terminated) run:
+            # re-arm the wall clock — max_seconds counts from `created`, so the
+            # next claim tick re-kills a resumed run before it moves (9ea37d2e:
+            # "user patch" → terminated again 1s later, twice). A human directly
+            # fixing the run IS the supervision the budget stands in for.
+            run["created"] = time.time()
+            store.log(run_id, "info", "patch", "user", "core",
+                      "budget re-armed after user patch")
         run["stats"]["patches"] += 1
         store.save_run(run)
     await _event(run_id, "info", "patch", "user", "core",

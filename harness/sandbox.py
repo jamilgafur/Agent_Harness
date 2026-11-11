@@ -302,6 +302,47 @@ class RunToolReq(BaseModel):
     args: dict = {}
 
 
+class CreateSkillReq(BaseModel):
+    """Declarative skill: one sentence of spec becomes a runnable tool module.
+    shell-template only — drop a .py directly for a custom run() (same file,
+    same discovery)."""
+    name: str
+    desc: str = ""
+    required: list[str] = []
+    cmd: str                          # shell template; {arg} placeholders
+
+
+_SKILL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+_SKILL_TEMPLATE = '''"""Skill {name!r}: {desc!r} (created via POST /create_skill)."""
+import shlex
+import subprocess
+
+TOOL = {meta}
+
+def run(**kwargs):
+    cmd = {cmd!r}.format(**{{k: shlex.quote(str(v)) for k, v in kwargs.items()}})
+    r = subprocess.run(cmd, shell=True, cwd={workspace!r}, capture_output=True,
+                       text=True, timeout=60)
+    return {{"rc": r.returncode, "stdout": r.stdout[:20000], "stderr": r.stderr[:2000]}}
+'''
+
+
+@app.post("/create_skill")
+def create_skill(req: CreateSkillReq) -> dict:
+    """The AI (or the UI) registers a NEW tool at runtime: validate the spec,
+    write /workspace/tools/{name}.py — discovery picks it up on next sync."""
+    if not _SKILL_NAME.match(req.name):
+        raise HTTPException(400, f"bad skill name {req.name!r} (lowercase, digits, _)")
+    for bad_placeholder in set(re.findall(r"\{(\w+)\}", req.cmd)) - set(req.required):
+        raise HTTPException(400, f"placeholder {{{bad_placeholder}}} is not a required arg")
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    (TOOLS_DIR / f"{req.name}.py").write_text(_SKILL_TEMPLATE.format(
+        name=req.name, desc=req.desc, workspace=str(WORKSPACE), cmd=req.cmd,
+        meta=json.dumps({"name": req.name, "desc": req.desc, "required": req.required})))
+    return {"created": req.name, "file": f"{req.name}.py",
+            "tool": _tool_modules().get(req.name)}
+
+
 def _tool_modules() -> dict:
     """Dynamic tools = /workspace/tools/*.py (TOOL dict + run()) + MCP tools
     from the manifest (prefixed mcp_<server>_<tool>)."""
